@@ -57,6 +57,9 @@ def run():
     print("  h6 - Cloud/Email")
     print("  server - Destination")
     print("="*50 + "\n")
+
+    with open('iperf3_traffic.py') as f:
+        exec(f.read(), {'net': net, 'SERVER_HOST': 'server', **globals()})
     
     # Open Mininet CLI for interactive commands
     CLI(net)
