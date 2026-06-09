@@ -2,7 +2,6 @@
 
 #Run within mininet CLI
 
-import re
 import csv, json, threading
 from time import sleep
 from datetime import datetime
@@ -86,7 +85,7 @@ def run_video(host, duration=30):
     """HD Video stream — 2 Mbps UDP, 1400-byte packets"""
     print(f"[Video]         {host.name} -> {SERVER_HOST}  ({duration}s)")
     out = host.cmd(f"iperf3 -c {_server_ip()} -u -b 5M -l 1400 -t {duration} --json")
-    _log("video", host, "udp", "2M", out)
+    _log("video", host, "udp", "5M", out)
 
 def run_web(host, duration=30):
     """Web browsing — 4 parallel TCP streams"""
@@ -115,7 +114,27 @@ def run_ping(host, count=10):
     """ICMP latency baseline"""
     print(f"[Ping]          {host.name} -> {SERVER_HOST}")
     result = host.cmd(f"ping -c {count} {_server_ip()}")
-    print(result)
+    
+    row = {
+        "timestamp": datetime.now().isoformat(),
+        "profile": "ping",
+        "host": host.name,
+        "host_ip": host.IP(),
+        "protocol": "icmp",
+        "bw_requested": "",
+        "mbps": "0",
+        "bytes": "0",
+        "retransmits": "0",
+        "jitter_ms": "0",
+        "lost_packets": "0",
+        "lost_pct": "0",
+        "flow_priority": "",
+        "qos_class": "",
+    }
+
+    with _lock:
+        _results.append(row)
+        
     return result
 
 
