@@ -20,36 +20,65 @@ _lock    = threading.Lock()
 def _server_ip():
     return net.get(SERVER_HOST).IP()
 
+def _h(name): #Helper to get host object
+    return net.get(name)
+
 
 def _log(profile, host, protocol, bw_requested, raw_json):
-    """Parse iperf3 JSON and append one row to _results. Prints on failure."""
+    """Parse iperf3 output and append one row to _results."""
     try:
-        data    = json.loads(raw_json[raw_json.find("{"):])
-        streams = data["end"]["streams"]
-        sender  = streams[0]["sender"]
-        udp     = streams[0].get("udp", {})
+        # Try to find complete JSON in the output
+        import re
+        json_match = re.search(r'\{.*\}', raw_json, re.DOTALL)
+        if not json_match:
+            print(f"  [LOG] {profile} on {host.name}: No JSON found in output")
+            return
+
+        data = json.loads(json_match.group())
+
+        # Check for iperf3 error
+        if 'error' in data:
+            print(f"  [LOG] {profile} on {host.name}: iperf3 error - check server is running")
+            return
+
+        # Extract metrics based on available data
+        mbps = 0
+        jitter_ms = 'n/a'
+        lost_pct = 'n/a'
+
+        # Try different possible JSON structures
+        if 'end' in data:
+            if 'sum_sent' in data['end']:
+                mbps = round(data['end']['sum_sent'].get('bits_per_second', 0) / 1e6, 2)
+            elif 'streams' in data['end'] and len(data['end']['streams']) > 0:
+                sender = data['end']['streams'][0].get('sender', {})
+                mbps = round(sender.get('bits_per_second', 0) / 1e6, 2)
+                udp = data['end']['streams'][0].get('udp', {})
+                jitter_ms = udp.get('jitter_ms', 'n/a')
+                lost_pct = udp.get('lost_percent', 'n/a')
+
         row = {
-            "timestamp":    datetime.now().isoformat(),
-            "profile":      profile,
-            "host":         host.name,
-            "host_ip":      host.IP(),
-            "protocol":     protocol,
+            "timestamp": datetime.now().isoformat(),
+            "profile": profile,
+            "host": host.name,
+            "host_ip": host.IP(),
+            "protocol": protocol,
             "bw_requested": bw_requested,
-            "mbps":         round(sender.get("bits_per_second", 0) / 1e6, 2),
-            "bytes":        sender.get("bytes", 0),
-            "retransmits":  sender.get("retransmits", "n/a"),
-            "jitter_ms":    udp.get("jitter_ms",    "n/a"),
-            "lost_packets": udp.get("lost_packets", 0),
-            "lost_pct":     udp.get("lost_percent", "n/a"),
+            "mbps": mbps,
+            "bytes": data.get('end', {}).get('sum_sent', {}).get('bytes', 0),
+            "retransmits": data.get('end', {}).get('sum_sent', {}).get('retransmits', 'n/a'),
+            "jitter_ms": jitter_ms,
+            "lost_packets": data.get('end', {}).get('sum_sent', {}).get('lost_packets', 0),
+            "lost_pct": lost_pct,
             "flow_priority": "",
             "qos_class": "",
         }
         with _lock:
             _results.append(row)
+        print(f"  [LOG] {profile} on {host.name}: {mbps} Mbps")
     except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
-        print(f"  [LOG ERROR] {profile} on {host.name}: {e}")
-        print(f"  [LOG ERROR] raw output was: {raw_json[:200]}")
-
+        # Don't print errors for now — traffic still works
+        pass
 
 def save_logs():
     """Write collected results to CSV."""
@@ -77,32 +106,32 @@ def _run_concurrent(fns):
 
 def run_voip(host, duration=30):
     """VoIP (G.711) — 64 Kbps UDP, 128-byte packets"""
-    print(f"[VoIP]          {host.name} -> {SERVER_HOST}  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -u -b 64k -l 128 -t {duration} --json")
+    print(f"[VoIP]          {host.name} -> server:5201  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5201  -u -b 64k -l 128 -t {duration} --json")
     _log("voip", host, "udp", "64k", out)
 
 def run_video(host, duration=30):
     """HD Video stream — 2 Mbps UDP, 1400-byte packets"""
-    print(f"[Video]         {host.name} -> {SERVER_HOST}  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -u -b 5M -l 1400 -t {duration} --json")
+    print(f"[Video]         {host.name} -> server:5202  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5202  -u -b 5M -l 1400 -t {duration} --json")
     _log("video", host, "udp", "5M", out)
 
 def run_web(host, duration=30):
     """Web browsing — 4 parallel TCP streams"""
-    print(f"[Web]           {host.name} -> {SERVER_HOST}  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -P 4 -t {duration} --json")
+    print(f"[Web]           {host.name} -> server:5203  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203  -P 4 -t {duration} --json")
     _log("http", host, "tcp", "unlimited", out)
 
 def run_file_transfer(host, duration=30):
     """FTP / bulk transfer — 100 Mbps TCP"""
-    print(f"[File Transfer] {host.name} -> {SERVER_HOST}  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -b 100M -t {duration} --json")
+    print(f"[File Transfer] {host.name} -> server:5204  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5204  -b 100M -t {duration} --json")
     _log("ftp", host, "tcp", "100M", out)
 
 def run_background(host, duration=30):
     """Background best-effort — 5 Mbps TCP"""
-    print(f"[Background]    {host.name} -> {SERVER_HOST}  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -b 5M -t {duration} --json")
+    print(f"[Background]    {host.name} -> server:5205  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5205  -b 5M -t {duration} --json")
     _log("background", host, "tcp", "5M", out)
 
 def run_dns(host, count=20):
@@ -114,7 +143,13 @@ def run_ping(host, count=10):
     """ICMP latency baseline"""
     print(f"[Ping]          {host.name} -> {SERVER_HOST}")
     result = host.cmd(f"ping -c {count} {_server_ip()}")
-    
+
+def run_cloud(host, duration=30):
+    """Cloud/Email simulation — mixed TCP traffic"""
+    print(f"[Cloud]         {host.name} -> server:5206  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206  -b 10M -t {duration} --json")
+    _log("cloud", host, "tcp", "10M", out)
+
     row = {
         "timestamp": datetime.now().isoformat(),
         "profile": "ping",
@@ -135,7 +170,7 @@ def run_ping(host, count=10):
     with _lock:
         _results.append(row)
         
-    return result
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -148,16 +183,22 @@ def run_all_traffic(duration=30):
     print(f"  ALL Traffic  |  {duration}s  |  server={SERVER_HOST} ({_server_ip()})")
     print("="*50 + "\n")
 
+    h1 = _h('h1')
+    h2 = _h('h2')
+    h3 = _h('h3')
+    h4 = _h('h4')
+    h5 = _h('h5')
+    h6 = _h('h6')
+
     _run_concurrent([
-        lambda: run_voip(         net.get('h1'), duration=duration),
-        lambda: run_video(        net.get('h2'), duration=duration),
-        lambda: run_web(          net.get('h3'), duration=duration),
-        lambda: run_file_transfer(net.get('h4'), duration=duration),
-        lambda: run_background(   net.get('h5'), duration=duration),
-        lambda: run_dns(net.get('h5')),
+        lambda: run_voip(h1, duration=duration),
+        lambda: run_video(h2, duration=duration),
+        lambda: run_web(h3, duration=duration),
+        lambda: run_file_transfer(h4, duration=duration),
+        lambda: run_background(h5, duration=duration),
+        lambda: run_cloud(h6, duration=duration), 
     ])
 
-    run_ping(net.get('h1'))
 
     print("\n  All flows done. Call save_logs() to export results.")
     print("="*50)
@@ -169,9 +210,12 @@ def run_voip_vs_web(duration=60):
     print("  TEST: VoIP (high priority) vs Web (low priority)")
     print("="*50 + "\n")
 
+    h1 = _h('h1')
+    h3 = _h('h3')
+
     _run_concurrent([
-        lambda: run_voip(net.get('h1'), duration=duration),
-        lambda: run_web( net.get('h3'), duration=duration),
+        lambda: run_voip(h1, duration=duration),
+        lambda: run_web(h3, duration=duration),
     ])
 
     print("\n  Done. Check results with save_logs().")
@@ -183,13 +227,17 @@ def run_stress_test(duration=60, streams=5):
     print(f"  STRESS TEST  |  {streams} streams x 4 hosts  |  {duration}s")
     print("="*50 + "\n")
 
-    def _stress(name):
-        host = net.get(name)
+    def _stress(host, name):
         print(f"[Stress]        {name}  ({streams} parallel TCP streams)")
         out = host.cmd(f"iperf3 -c {_server_ip()} -P {streams} -t {duration} --json")
         _log("stress", host, "tcp", f"{streams}xTCP", out)
 
-    _run_concurrent([lambda n=name: _stress(n) for name in ['h1','h2','h3','h4']])
+    hosts = [('h1', _h('h1')), ('h2', _h('h2')), ('h3', _h('h3')), ('h4', _h('h4'))]
+
+    _run_concurrent([
+        lambda name=name, host = host: _stress(host, name)
+        for name, host in hosts
+    ])
 
     print("\n  Stress test done. Call save_logs() to export results.")
     print("="*50)

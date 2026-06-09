@@ -60,10 +60,16 @@ def run():
 
     with open('iperf3_traffic.py') as f:
         exec(f.read(), {'net': net, 'SERVER_HOST': 'server', **globals()})
-    
+
+    # Start multiple iperf3 servers on different ports
+    print("Starting iperf3 servers on ports 5201-5206...")
+    for port in range(5201, 5207):
+        net.get('server').cmd(f"iperf3 -s -p {port} &")
+    print("All servers ready.")
+
     # Open Mininet CLI for interactive commands
     CLI(net)
-    
+
     # Stop the network when CLI exits
     net.stop()
 
