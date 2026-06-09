@@ -119,7 +119,7 @@ def run_video(host, duration=30):
 def run_web(host, duration=30):
     """Web browsing — 4 parallel TCP streams"""
     print(f"[Web]           {host.name} -> server:5203  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203  -P 4 -t {duration} --json")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203  -P 2 -t {duration} --json")
     _log("http", host, "tcp", "unlimited", out)
 
 def run_file_transfer(host, duration=30):
