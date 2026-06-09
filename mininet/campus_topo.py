@@ -8,23 +8,23 @@ from mininet.cli import CLI
 from mininet.log import setLogLevel
 
 class CampusTopo(Topo):
-    def  build(self):
+    def build(self):
 
-    s1 = self.addSwitch("s1") #OpenFLow switch
-    server = self.addHost("server", ip = "10.0.0.10/24") #Server as traffic destination
+        s1 = self.addSwitch("s1") #OpenFLow switch
+        server = self.addHost("server", ip = "10.0.0.10/24") #Server as traffic destination
 
-    #Client hosts
-    h1 = self.addHost("h1", ip = "10.0.0.1/24") #browsing
-    h2 = self.addHost("h2", ip = "10.0.0.2/24") #video conferencing
-    h3 = self.addHost("h3", ip = "10.0.0.3/24") #VoIP
-    h4 = self.addHost("h4", ip = "10.0.0.4/24") #file transfer
-    h5 = self.addHost("h5", ip = "10.0.0.5/24") #P2P
-    h6 = self.addHost("h6", ip = "10.0.0.5/24") #cloud/email
+        #Client hosts
+        h1 = self.addHost("h1", ip = "10.0.0.1/24") #browsing
+        h2 = self.addHost("h2", ip = "10.0.0.2/24") #video conferencing
+        h3 = self.addHost("h3", ip = "10.0.0.3/24") #VoIP
+        h4 = self.addHost("h4", ip = "10.0.0.4/24") #file transfer
+        h5 = self.addHost("h5", ip = "10.0.0.5/24") #P2P
+        h6 = self.addHost("h6", ip = "10.0.0.6/24") #cloud/email
 
-    link_opts = dict(bw = 1000, delay = "5ms", loss = 0) #1Gbps, 5ms delay, no loss. Can increase loss to simulate congestion/test robustness
+        link_opts = dict(bw = 1000, delay = "5ms", loss = 0) #1Gbps, 5ms delay, no loss. Can increase loss to simulate congestion/test robustness
 
-    for host in [server, h1, h2, h3, h4, h5, h6]:
-        self.addLink(host, s1, cls = TCLink, **link_opts)
+        for host in [server, h1, h2, h3, h4, h5, h6]:
+            self.addLink(host, s1, cls = TCLink, **link_opts)
 
 
 def run():
@@ -33,10 +33,10 @@ def run():
         topo = topo,
         controller = RemoteController(
             "ryu",
-            ip = "127.0.0.1", #Runs on same machine"
+            ip = "127.0.0.1", #Runs on same machine
             port = 6633 #Default OpenFLow port
         ),
-        link = TCLink
+        link = TCLink,
         autoSetMacs = True #Automatically assign MAC addresses
     )
 
