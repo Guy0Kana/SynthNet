@@ -83,5 +83,16 @@ source ~/ml-env/bin/activate
 pip install torch fastapi uvicorn requests cesnet-models numpy pandas
 ```
 
+### 7. Starting up virtual env
+Run these commands in two separate terminals to get the venv up and running
+
+```bash
+source ~/ryu-env/bin/activate
+```
+
+```bash
+source ~/ml-env/bin/activate
+```
+
 
 
