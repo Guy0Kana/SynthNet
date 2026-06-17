@@ -257,7 +257,35 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod)
 
-        self.logger.info("Default flow installed (send to controller)")
+        # ARP flood flow (for ping to work)
+        match_arp = parser.OFPMatch(eth_type=0x0806)
+        actions_arp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        inst_arp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_arp)]
+        mod_arp = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=1,
+            match=match_arp,
+            instructions=inst_arp,
+            idle_timeout=60,
+            hard_timeout=300,
+        )
+        datapath.send_msg(mod_arp)
+
+        # ICMP flood flow (for ping to work)
+        match_icmp = parser.OFPMatch(eth_type=0x0800, ip_proto=1)
+        actions_icmp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        inst_icmp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_icmp)]
+        mod_icmp = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=1,
+            match=match_icmp,
+            instructions=inst_icmp,
+            idle_timeout=60,
+            hard_timeout=300,
+        )
+        datapath.send_msg(mod_icmp)
+
+        self.logger.info("Default ARP, ICMP  flows installed")
 
     def _install_meters(self, datapath):
         ofproto = datapath.ofproto
