@@ -64,38 +64,24 @@ PRIORITY_MAP = {
 }
 
 # ============================================================================
-# PPI Transform (manual implementation)
+# PPI Transform
 # ============================================================================
 
 class PPITransform:
-    """Manual PPI transform matching CESNET-TLS22_WEEK40 normalization"""
-    
     def __init__(self):
-        # Values from CESNET-TLS22_WEEK40 weights metadata
         self.psize_mean = 708.39
         self.psize_scale = 581.24
         self.ipt_mean = 228.11
         self.ipt_scale = 1517.16
-        # dir is already [-1, 1] so no scaling needed
     
     def __call__(self, tensor):
-        """Apply transform to PPI tensor (1, 3, 30)"""
-        # Clone to avoid modifying original
         t = tensor.clone()
-        
-        # Channel 0: sizes - standard scaling, clip to [1, 1460]
         t[:, 0, :] = (t[:, 0, :] - self.psize_mean) / self.psize_scale
         t[:, 0, :] = torch.clamp(t[:, 0, :], min=-1.0, max=1.0)
-        
-        # Channel 1: ipts - standard scaling, clip to [1, 15000]
         t[:, 1, :] = (t[:, 1, :] - self.ipt_mean) / self.ipt_scale
         t[:, 1, :] = torch.clamp(t[:, 1, :], min=-1.0, max=1.0)
-        
-        # Channel 2: dirs - already in [-1, 1]
         t[:, 2, :] = torch.clamp(t[:, 2, :], min=-1.0, max=1.0)
-        
         return t
-
 
 # ============================================================================
 # Traffic Class Mapper
@@ -129,15 +115,12 @@ class TrafficClassifier:
         self.model = mm_cesnet_v1(
             weights=MM_CESNET_V1_Weights.CESNET_TLS22_WEEK40
         )
-        
-        # Use manual transform instead of the dict
         self.ppi_transform = PPITransform()
         
         self.model.to(self.device)
         self.model.eval()
         
         self.mapper = TrafficClassMapper()
-        
         self.total_predictions = 0
         self.stats = {cat: 0 for cat in CAMPUS_CATEGORIES}
         
@@ -156,31 +139,28 @@ class TrafficClassifier:
             sizes, ipts, dirs
         ], dtype=torch.float32).unsqueeze(0)
         
-        # Apply PPI transform
         ppi_tensor = self.ppi_transform(ppi_tensor)
-        
-        # Build flowstats tensor: (1, 17)
         flowstats_tensor = torch.tensor([flowstats], dtype=torch.float32)
         
         with torch.no_grad():
             ppi_tensor = ppi_tensor.to(self.device)
             flowstats_tensor = flowstats_tensor.to(self.device)
-            
             logits = self.model((ppi_tensor, flowstats_tensor))
             probabilities = F.softmax(logits, dim=1)
         
         probs = probabilities[0].cpu().numpy()
         
+        # Convert all NumPy types to Python native types
         top5_ids = np.argsort(probs)[-5:][::-1]
         top5 = [{
             'class_id': int(i),
-            'class_name': self.get_cesnet_class_name(i),
+            'class_name': str(self.get_cesnet_class_name(i)),
             'probability': float(probs[i])
         } for i in top5_ids]
         
-        best_id = top5_ids[0]
-        best_class_name = self.get_cesnet_class_name(best_id)
-        campus_category = self.mapper.map(best_class_name)
+        best_id = int(top5_ids[0])
+        best_class_name = str(self.get_cesnet_class_name(best_id))
+        campus_category = str(self.mapper.map(best_class_name))
         confidence = float(probs[best_id])
         
         self.stats[campus_category] += 1
@@ -188,9 +168,9 @@ class TrafficClassifier:
         
         return {
             'category': campus_category,
-            'category_id': CAMPUS_CATEGORIES.index(campus_category),
+            'category_id': int(CAMPUS_CATEGORIES.index(campus_category)),
             'confidence': confidence,
-            'priority': PRIORITY_MAP.get(campus_category, 4),
+            'priority': int(PRIORITY_MAP.get(campus_category, 4)),
             'top_prediction': {
                 'class_id': best_id,
                 'class_name': best_class_name,
