@@ -42,6 +42,12 @@ def run():
 
     net.start()
 
+    #Enable OpenFLow 1.3 and Meters
+    s1 = net.get('s1')
+    s1.cmd('ovs-vsctl set bridge s1 protocols=OpenFlow13')
+    s1.cmd('ovs-vsctl set bridge s1 other_config:meter-max=255')
+    print("✅ OpenFlow 1.3 and meters enabled on switch")
+
     print("\n" + "="*50)
     print("Network Started Successfully!")
     print("="*50)
