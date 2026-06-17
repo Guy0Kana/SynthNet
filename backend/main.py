@@ -64,6 +64,40 @@ PRIORITY_MAP = {
 }
 
 # ============================================================================
+# PPI Transform (manual implementation)
+# ============================================================================
+
+class PPITransform:
+    """Manual PPI transform matching CESNET-TLS22_WEEK40 normalization"""
+    
+    def __init__(self):
+        # Values from CESNET-TLS22_WEEK40 weights metadata
+        self.psize_mean = 708.39
+        self.psize_scale = 581.24
+        self.ipt_mean = 228.11
+        self.ipt_scale = 1517.16
+        # dir is already [-1, 1] so no scaling needed
+    
+    def __call__(self, tensor):
+        """Apply transform to PPI tensor (1, 3, 30)"""
+        # Clone to avoid modifying original
+        t = tensor.clone()
+        
+        # Channel 0: sizes - standard scaling, clip to [1, 1460]
+        t[:, 0, :] = (t[:, 0, :] - self.psize_mean) / self.psize_scale
+        t[:, 0, :] = torch.clamp(t[:, 0, :], min=-1.0, max=1.0)
+        
+        # Channel 1: ipts - standard scaling, clip to [1, 15000]
+        t[:, 1, :] = (t[:, 1, :] - self.ipt_mean) / self.ipt_scale
+        t[:, 1, :] = torch.clamp(t[:, 1, :], min=-1.0, max=1.0)
+        
+        # Channel 2: dirs - already in [-1, 1]
+        t[:, 2, :] = torch.clamp(t[:, 2, :], min=-1.0, max=1.0)
+        
+        return t
+
+
+# ============================================================================
 # Traffic Class Mapper
 # ============================================================================
 
@@ -95,7 +129,9 @@ class TrafficClassifier:
         self.model = mm_cesnet_v1(
             weights=MM_CESNET_V1_Weights.CESNET_TLS22_WEEK40
         )
-        self.ppi_transform = MM_CESNET_V1_Weights.CESNET_TLS22_WEEK40.transforms()
+        
+        # Use manual transform instead of the dict
+        self.ppi_transform = PPITransform()
         
         self.model.to(self.device)
         self.model.eval()
@@ -115,12 +151,15 @@ class TrafficClassifier:
             return f"class_{class_id}"
     
     def predict(self, sizes, ipts, dirs, flowstats):
-        # PPI tensor: (1, 3, 30)
+        # Build PPI tensor: (1, 3, 30)
         ppi_tensor = torch.tensor([
             sizes, ipts, dirs
         ], dtype=torch.float32).unsqueeze(0)
         
+        # Apply PPI transform
         ppi_tensor = self.ppi_transform(ppi_tensor)
+        
+        # Build flowstats tensor: (1, 17)
         flowstats_tensor = torch.tensor([flowstats], dtype=torch.float32)
         
         with torch.no_grad():
