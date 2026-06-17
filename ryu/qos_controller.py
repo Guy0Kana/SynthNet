@@ -14,8 +14,8 @@ from collections import defaultdict, Counter
 
 
 ML_API_URL = "http://localhost:8000/classify"
-FLOW_SAMPLES = 30          # Number of packets to sample per flow
-FEATURE_TIMEOUT = 5        # Seconds to wait for flow completion
+FLOW_SAMPLES = 30
+FEATURE_TIMEOUT = 5
 
 TCP_FIN = 0x01
 TCP_SYN = 0x02
@@ -26,13 +26,7 @@ TCP_URG = 0x20
 TCP_ECE = 0x40
 TCP_CWR = 0x80
 
-METER_BANDS = {
-    'high': {'rate': 1000000, 'burst': 100000},    # 1 Gbps (no limit)
-    'medium': {'rate': 500000, 'burst': 50000},    # 500 Mbps
-    'low': {'rate': 100000, 'burst': 10000},       # 100 Mbps
-}
-
-# QoS Priority Mapping  (higher number + higher priority)
+# QoS Priority Mapping (higher number = higher priority)
 PRIORITY_MAP = {
     'voip': 10,
     'cloud_email': 9,
@@ -85,6 +79,7 @@ def extract_tcp_flags(tcp_pkt):
             flags.append('FIN')
     return flags
 
+
 class FlowBuffer:
     def __init__(self, flow_key, timeout=FEATURE_TIMEOUT):
         self.flow_key = flow_key
@@ -95,7 +90,8 @@ class FlowBuffer:
         self.origin_src = None
         self.src_ip = None
 
-       self.bytes_fwd = 0
+        # FIXED: Proper indentation (8 spaces)
+        self.bytes_fwd = 0
         self.bytes_rev = 0
         self.packets_fwd = 0
         self.packets_rev = 0
@@ -115,7 +111,6 @@ class FlowBuffer:
 
         direction = 1 if src_ip == self.origin_src else -1
 
-        # Update byte and packet counters
         pkt_size = len(pkt_data)
         if direction == 1:
             self.bytes_fwd += pkt_size
@@ -124,7 +119,6 @@ class FlowBuffer:
             self.bytes_rev += pkt_size
             self.packets_rev += 1
 
-        # Update TCP flags if present (iterate through list)
         if tcp_flags:
             if direction == 1:
                 for flag in tcp_flags:
@@ -133,12 +127,10 @@ class FlowBuffer:
                 for flag in tcp_flags:
                     self.tcp_flags_rev[flag] += 1
 
-        # Track PPI roundtrips (direction changes)
         if self.last_dir is not None and self.last_dir != direction:
             self.ppi_roundtrips += 1
 
         self.last_dir = direction
-
 
         self.packets.append({
             'size': len(pkt_data),
@@ -155,37 +147,33 @@ class FlowBuffer:
         return (time.time() - self.start_time) > self.timeout
 
     def get_flowstats(self):
-        """Compute 17 flowstats features required by mm_cesnet_v1"""
-
         duration = time.time() - self.start_time
         if duration < 0.001:
             duration = 0.001
 
-        # PPI sequence duration (time between first and last packet)
         if len(self.packets) >= 2:
             ppi_duration = self.packets[-1]['timestamp'] - self.packets[0]['timestamp']
         else:
             ppi_duration = 0
 
-        # Flowstats in exact order required by mm_cesnet_v1
         flowstats = [
-            self.bytes_fwd,                       # BYTES
-            self.bytes_rev,                       # BYTES_REV
-            self.packets_fwd,                     # PACKETS
-            self.packets_rev,                     # PACKETS_REV
-            duration,                             # DURATION
-            len(self.packets),                    # PPI_LEN
-            self.ppi_roundtrips,                  # PPI_ROUNDTRIPS
-            ppi_duration,                         # PPI_DURATION
-            self.tcp_flags_fwd.get('CWR', 0),     # FLAG_CWR
-            self.tcp_flags_rev.get('CWR', 0),     # FLAG_CWR_REV
-            self.tcp_flags_fwd.get('ECE', 0),     # FLAG_ECE
-            self.tcp_flags_rev.get('ECE', 0),     # FLAG_ECE_REV
-            self.tcp_flags_rev.get('PSH', 0),     # FLAG_PSH_REV (backward only)
-            self.tcp_flags_fwd.get('RST', 0),     # FLAG_RST
-            self.tcp_flags_rev.get('RST', 0),     # FLAG_RST_REV
-            self.tcp_flags_fwd.get('FIN', 0),     # FLAG_FIN
-            self.tcp_flags_rev.get('FIN', 0),     # FLAG_FIN_REV
+            self.bytes_fwd,
+            self.bytes_rev,
+            self.packets_fwd,
+            self.packets_rev,
+            duration,
+            len(self.packets),
+            self.ppi_roundtrips,
+            ppi_duration,
+            self.tcp_flags_fwd.get('CWR', 0),
+            self.tcp_flags_rev.get('CWR', 0),
+            self.tcp_flags_fwd.get('ECE', 0),
+            self.tcp_flags_rev.get('ECE', 0),
+            self.tcp_flags_rev.get('PSH', 0),
+            self.tcp_flags_fwd.get('RST', 0),
+            self.tcp_flags_rev.get('RST', 0),
+            self.tcp_flags_fwd.get('FIN', 0),
+            self.tcp_flags_rev.get('FIN', 0),
         ]
 
         return flowstats
@@ -194,17 +182,14 @@ class FlowBuffer:
         if len(self.packets) < 5:
             return None
 
-        # Packet sizes
         sizes = [p['size'] for p in self.packets]
 
-        # Extract inter-packet times (microseconds)
         timestamps = [p['timestamp'] for p in self.packets]
-        ipts = [0]  # First packet has no previous packet
+        ipts = [0]
         for i in range(1, len(timestamps)):
             ipt_us = (timestamps[i] - timestamps[i-1]) * 1_000_000
             ipts.append(int(ipt_us))
 
-        # Extract directions
         dirs = [p['dir'] for p in self.packets]
 
         while len(sizes) < FLOW_SAMPLES:
@@ -232,11 +217,9 @@ class QoSRyuController(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(QoSRyuController, self).__init__(*args, **kwargs)
 
-        # Flow buffers for new flows
         self.flow_buffers = {}
         self.flow_classifications = {}
 
-        # Statistics
         self.stats = {
             'flows_classified': 0,
             'policies_applied': 0,
@@ -245,7 +228,6 @@ class QoSRyuController(app_manager.RyuApp):
             'packets_captured': 0,
         }
 
-        # Start background thread for cleanup
         self.cleanup_thread = hub.spawn(self._cleanup_loop)
 
         self.logger.info("QoS Ryu Controller initialized")
@@ -253,23 +235,16 @@ class QoSRyuController(app_manager.RyuApp):
         self.logger.info(f"Collecting first {FLOW_SAMPLES} packets per flow")
         self.logger.info("=" * 60)
 
-    # Switch Connection Handler
-
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """
-        Handle switch connection and install default table-miss flow.
-        """
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         self.logger.info(f"Switch {datapath.id} connected")
 
-        # Create meters for QoS
         self._install_meters(datapath)
 
-        # Default: send all unmatched packets to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
@@ -289,10 +264,10 @@ class QoSRyuController(app_manager.RyuApp):
         parser = datapath.ofproto_parser
 
         meter_configs = [
-            (1, 1000000, 100000),  # High priority
-            (2, 500000, 50000),    # Medium priority
-            (3, 100000, 10000),    # Low priority
-            (4, 50000, 5000),      # Lowest priority
+            (1, 1000000, 100000),
+            (2, 500000, 50000),
+            (3, 100000, 10000),
+            (4, 50000, 5000),
         ]
 
         for meter_id, rate, burst in meter_configs:
@@ -307,114 +282,95 @@ class QoSRyuController(app_manager.RyuApp):
 
         self.logger.info("Meter tables installed (IDs 1-4)")
 
-    # Packet-In Handler
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """
-        Handle incoming packets from the switch.
-        """
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
 
-        # Parse packet
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
         if not eth:
             return
 
-        # Extract L3/L4 info
-        flow_key, src_ip, tcp_flags = self._extract_flow_info(pkt, in_port)
+        # FIXED: Changed to _extract_flow_key (method exists)
+        flow_key, src_ip, tcp_flags = self._extract_flow_key(pkt, in_port)
 
         if flow_key is None:
-            # Non-IP traffic,  forward normally
             self._forward_normal(datapath, in_port, msg.data)
             return
 
         self.stats['packets_captured'] += 1
 
-        # Check if flow is already classified
         if flow_key in self.flow_classifications:
-            # Flow already classified — install flow rule
             traffic_class = self.flow_classifications[flow_key]
             self._install_qos_flow(datapath, flow_key, in_port, traffic_class, msg.data)
             return
-        
-        # New flow — buffer packets for classification
+
         if flow_key not in self.flow_buffers:
             self.flow_buffers[flow_key] = FlowBuffer(flow_key)
             self.logger.info(f"New flow detected: {flow_key[:2]}... (total packets: {len(self.flow_buffers)})")
-        
-        # Add packet to buffer
+
         buffer = self.flow_buffers[flow_key]
         timestamp = time.time()
         completed = buffer.add_packet(msg.data, timestamp, src_ip, tcp_flags)
 
         self.logger.debug(f"Flow buffer: {buffer.packet_count()}/{FLOW_SAMPLES} packets")
-        
+
         if completed:
-            # Enough packets collected — classify!
             hub.spawn(self._classify_flow, datapath, flow_key, in_port, buffer)
-    
+
     def _extract_flow_key(self, pkt, in_port):
-        """
-        Extract unique flow identifier from packet.
-        Returns tuple (src_ip, dst_ip, src_port, dst_port, protocol)
-        """
         ip = pkt.get_protocol(ipv4.ipv4)
         if not ip:
             return None, None, None
-        
+
         src_ip = ip.src
         dst_ip = ip.dst
         protocol = ip.proto
-        
+
         src_port = None
         dst_port = None
         tcp_flags = None
-        
+
         tcp_pkt = pkt.get_protocol(tcp.tcp)
         udp_pkt = pkt.get_protocol(udp.udp)
-        
+
         if tcp_pkt:
             src_port = tcp_pkt.src_port
             dst_port = tcp_pkt.dst_port
             tcp_flags = extract_tcp_flags(tcp_pkt)
-
         elif udp_pkt:
             src_port = udp_pkt.src_port
             dst_port = udp_pkt.dst_port
-        
+
         flow_key = (src_ip, dst_ip, src_port, dst_port, protocol, in_port)
         return flow_key, src_ip, tcp_flags
-    
+
     def _classify_flow(self, datapath, flow_key, in_port, buffer):
         ppi_features = buffer.extract_ppi_features()
         flowstats = buffer.get_flowstats()
-        
+
         if not ppi_features:
-            # Fallback to default classification
             self.logger.warning(f"Insufficient features for {flow_key[:2]}, using default")
             hub.spawn(self._install_default_flow, datapath, flow_key, in_port)
             del self.flow_buffers[flow_key]
             return
-        
-        # Prepare API request
+
+        # FIXED: Changed 'features' to 'ppi_features'
         api_payload = {
-            'sizes': features['sizes'],
-            'ipts': features['ipts'],
-            'dirs': features['dirs'],
+            'sizes': ppi_features['sizes'],
+            'ipts': ppi_features['ipts'],
+            'dirs': ppi_features['dirs'],
             'flowstats': flowstats
         }
-        
+
         src_ip = flow_key[0] if flow_key else "unknown"
         self.logger.info(f"Classifying flow from {src_ip} ({buffer.packet_count()} packets collected)")
-        
-        # Call ML backend
+
         try:
             self.stats['api_calls'] += 1
             response = requests.post(
@@ -431,10 +387,7 @@ class QoSRyuController(app_manager.RyuApp):
                 self.logger.info(f"Flow classified as: {traffic_class} (confidence: {confidence:.2f})")
                 self.stats['flows_classified'] += 1
 
-                # Store classification
                 self.flow_classifications[flow_key] = traffic_class
-
-                # Install QoS policy
                 hub.spawn(self._install_qos_flow, datapath, flow_key, in_port, traffic_class, None)
             else:
                 self.logger.warning(f"API error: {response.status_code}")
@@ -443,58 +396,49 @@ class QoSRyuController(app_manager.RyuApp):
         except requests.exceptions.RequestException as e:
             self.logger.warning(f"ML backend unreachable: {e}")
             self.stats['api_failures'] += 1
-            self._install_default_flow(datapath, flow_key, in_port)
+            hub.spawn(self._install_default_flow, datapath, flow_key, in_port)
 
-        # Remove from buffers
         if flow_key in self.flow_buffers:
             del self.flow_buffers[flow_key]
 
     def _install_qos_flow(self, datapath, flow_key, in_port, traffic_class, data):
-        """
-        Install OpenFlow rule with QoS policies.
-        """
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         src_ip, dst_ip, src_port, dst_port, protocol, in_port_val = flow_key
 
-        # Build match
         match = parser.OFPMatch(
-            eth_type=0x0800,  # IPv4
+            eth_type=0x0800,
             ip_proto=protocol,
             ipv4_src=src_ip,
             ipv4_dst=dst_ip,
         )
 
         if src_port and dst_port:
-            if protocol == 6:  # TCP
+            if protocol == 6:
                 match.set_tcp_src(src_port)
                 match.set_tcp_dst(dst_port)
-            elif protocol == 17:  # UDP
+            elif protocol == 17:
                 match.set_udp_src(src_port)
                 match.set_udp_dst(dst_port)
 
-        # Determine priority and meter based on traffic class
         priority = PRIORITY_MAP.get(traffic_class, 4)
         meter_id = METER_MAP.get(traffic_class, 2)
 
-        # Apply actions: output to all ports (flooding for demo)
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
 
-        # Instructions with meter for rate limiting
         instructions = [
             parser.OFPInstructionMeter(meter_id),
             parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
         ]
 
-        # Install flow with timeout (remove after inactivity)
         mod = parser.OFPFlowMod(
             datapath=datapath,
             priority=priority,
             match=match,
             instructions=instructions,
-            idle_timeout=60,   # Remove after 60s inactivity
-            hard_timeout=300,  # Remove after 5 minutes
+            idle_timeout=60,
+            hard_timeout=300,
             buffer_id=ofproto.OFP_NO_BUFFER,
         )
 
@@ -504,16 +448,10 @@ class QoSRyuController(app_manager.RyuApp):
         self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority}, meter={meter_id})")
 
     def _install_default_flow(self, datapath, flow_key, in_port):
-        """
-        Install default flow when ML backend is unavailable.
-        """
         self.flow_classifications[flow_key] = 'default'
         self._install_qos_flow(datapath, flow_key, in_port, 'default', None)
 
     def _forward_normal(self, datapath, in_port, data):
-        """
-        Forward non-IP traffic normally.
-        """
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
@@ -527,11 +465,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(out)
 
-
-    # Maintenance
-
     def _cleanup_loop(self):
-       #Background thread to clean up expired flow buffers
         while True:
             hub.sleep(1)
 
@@ -540,21 +474,17 @@ class QoSRyuController(app_manager.RyuApp):
                 if buffer.is_expired():
                     expired.append((flow_key, buffer))
 
-             for flow_key, buffer in expired:
+            # FIXED: Proper indentation (not inside if)
+            for flow_key, buffer in expired:
                 src_ip = buffer.src_ip if buffer.src_ip else "unknown"
                 self.logger.warning(f"Flow from {src_ip} expired with {buffer.packet_count()} packets")
                 del self.flow_buffers[flow_key]
 
-
-    # Utility
-
     @set_ev_cls(ofp_event.EventOFPErrorMsg, MAIN_DISPATCHER)
     def error_handler(self, ev):
-        """Log OpenFlow errors"""
         self.logger.error(f"OpenFlow error: {ev.msg}")
-    
+
     def get_stats(self):
-        """Return controller statistics"""
         return {
             'flows_classified': self.stats['flows_classified'],
             'policies_applied': self.stats['policies_applied'],
@@ -564,4 +494,3 @@ class QoSRyuController(app_manager.RyuApp):
             'active_buffers': len(self.flow_buffers),
             'classified_flows': len(self.flow_classifications),
         }
-
