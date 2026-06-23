@@ -346,6 +346,7 @@ class QoSRyuController(app_manager.RyuApp):
         timestamp = time.time()
         completed = buffer.add_packet(msg.data, timestamp, src_ip, tcp_flags)
 
+        self._forward_normal(datapath, in_port, msg.data)
         self.logger.debug(f"Flow buffer: {buffer.packet_count()}/{FLOW_SAMPLES} packets")
 
         if completed:
@@ -492,8 +493,8 @@ class QoSRyuController(app_manager.RyuApp):
             #Flood flows for non-IPv4 traffic
             if eth_type != 0x0800:
                 match = parser.OFPMatch(eth_type=eth_type)
-                actions = [parser.OFPActionOutput(ofproto.OFP_FLOOD)]
-                instructions = [parser.OFPInstructions(ofproto.OFPIT_APPLY_ACTIONS, actiond)]
+                actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+                instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
                 mod = parser.OFPFlowMod(
                     datapath=datapath,
                     priority=1,
