@@ -385,11 +385,12 @@ class QoSRyuController(app_manager.RyuApp):
 
         if not ppi_features:
             self.logger.warning(f"Insufficient features for {flow_key[:2]}, using default")
-            hub.spawn(self._install_default_flow, datapath, flow_key, in_port)
-            del self.flow_buffers[flow_key]
+            self._install_default_flow(datapath, flow_key, in_port)
+            if flow_key in self.flow_buffers:
+                del self.flow_buffers[flow_key]
             return
 
-        # FIXED: Changed 'features' to 'ppi_features'
+      
         api_payload = {
             'sizes': ppi_features['sizes'],
             'ipts': ppi_features['ipts'],
@@ -417,15 +418,15 @@ class QoSRyuController(app_manager.RyuApp):
                 self.stats['flows_classified'] += 1
 
                 self.flow_classifications[flow_key] = traffic_class
-                hub.spawn(self._install_qos_flow, datapath, flow_key, in_port, traffic_class, None)
+                self._install_qos_flow(datapath, flow_key, in_port, traffic_class, None)
             else:
                 self.logger.warning(f"API error: {response.status_code}")
-                hub.spawn(self._install_default_flow, datapath, flow_key, in_port)
+                self._install_default_flow(datapath, flow_key, in_port)
 
         except requests.exceptions.RequestException as e:
             self.logger.warning(f"ML backend unreachable: {e}")
             self.stats['api_failures'] += 1
-            hub.spawn(self._install_default_flow, datapath, flow_key, in_port)
+            self._install_default_flow(datapath, flow_key, in_port)
 
         if flow_key in self.flow_buffers:
             del self.flow_buffers[flow_key]
