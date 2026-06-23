@@ -483,31 +483,30 @@ class QoSRyuController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Parse packet to get ethertype
         pkt = packet.Packet(data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        if not eth:
-            return
+        if eth:
+            eth_type = eth.ethertype
 
-        # Install a flow for this ethertype (ARP, etc.)
-        match = parser.OFPMatch(eth_type=eth.ethertype)
+            #Flood flows for non-IPv4 traffic
+            if eth_type != 0x0800:
+                match = parser.OFPMatch(eth_type=eth_type)
+                actions = [parser.OFPActionOutput(ofproto.OFP_FLOOD)]
+                instructions = [parser.OFPInstructions(ofproto.OFPIT_APPLY_ACTIONS, actiond)]
+                mod = parser.OFPFlowMod(
+                    datapath=datapath,
+                    priority=1,
+                    match=match,
+                    instructions=instructions,
+                    idle_timeout=60,
+                    hard_timeout=300,
+                )
+                datapath.send_msg(mod)
+                self.logger.debug(f"Installed flood flow for eth_type=0x{eth_type:04x}")
+
+
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-        instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-
-        mod = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=1,  # Higher than default (0)
-            match=match,
-            instructions=instructions,
-            idle_timeout=60,
-            hard_timeout=300,
-        )
-        datapath.send_msg(mod)
-
-        self.logger.info(f"Installed flood flow for eth_type={hex(eth.ethertype)}")
-
-        # Also send this packet out
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=ofproto.OFP_NO_BUFFER,
