@@ -243,7 +243,7 @@ class QoSRyuController(app_manager.RyuApp):
 
         self.logger.info(f"Switch {datapath.id} connected")
 
-        self._install_meters(datapath)
+        #self._install_meters(datapath)
 
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
@@ -455,10 +455,9 @@ class QoSRyuController(app_manager.RyuApp):
         priority = PRIORITY_MAP.get(traffic_class, 4)
         meter_id = METER_MAP.get(traffic_class, 2)
 
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
 
         instructions = [
-            parser.OFPInstructionMeter(meter_id),
             parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
         ]
 
