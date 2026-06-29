@@ -15,7 +15,7 @@ from collections import defaultdict, Counter
 
 ML_API_URL = "http://localhost:8000/classify"
 FLOW_SAMPLES = 30
-FEATURE_TIMEOUT = 30  # Increased from 5 to 30 seconds
+FEATURE_TIMEOUT = 30
 
 TCP_FIN = 0x01
 TCP_SYN = 0x02
@@ -356,7 +356,6 @@ class QoSRyuController(app_manager.RyuApp):
         timestamp = time.time()
         completed = buffer.add_packet(msg.data, timestamp, src_ip, tcp_flags)
 
-        # Forward the packet while collecting
         self._forward_normal(datapath, in_port, msg.data)
         self.logger.debug(f"Flow buffer: {buffer.packet_count()}/{FLOW_SAMPLES} packets")
 
@@ -444,14 +443,16 @@ class QoSRyuController(app_manager.RyuApp):
 
         src_ip, dst_ip, src_port, dst_port, protocol, in_port_val = flow_key
 
+        # Build match with in_port included (required for OpenFlow 1.3)
         match = parser.OFPMatch(
+            in_port=in_port_val,
             eth_type=0x0800,
             ip_proto=protocol,
             ipv4_src=src_ip,
             ipv4_dst=dst_ip,
         )
 
-        if src_port and dst_port:
+        if src_port and dst_port and src_port > 0 and dst_port > 0:
             if protocol == 6:
                 match.set_tcp_src(src_port)
                 match.set_tcp_dst(dst_port)
@@ -461,18 +462,24 @@ class QoSRyuController(app_manager.RyuApp):
 
         priority = PRIORITY_MAP.get(traffic_class, 4)
 
-        # Determine output port using MAC learning table
+        # Determine output port and action ONCE
         dpid = datapath.id
-        out_port = ofproto.OFPP_FLOOD  # Default fallback
+        out_port = None
 
         if dst_mac and dpid in self.mac_to_port:
             if dst_mac in self.mac_to_port[dpid]:
                 out_port = self.mac_to_port[dpid][dst_mac]
                 self.logger.debug(f"Using learned port {out_port} for dst_mac {dst_mac}")
-            else:
-                self.logger.debug(f"Unknown dst_mac {dst_mac}, using FLOOD")
 
-        actions = [parser.OFPActionOutput(out_port)]
+        # Create the final action once
+        if out_port is not None:
+            final_action = parser.OFPActionOutput(out_port)
+            self.logger.debug(f"Using learned port {out_port} for {traffic_class}")
+        else:
+            final_action = parser.OFPActionOutput(ofproto.OFPP_NORMAL)
+            self.logger.debug(f"No learned port, using NORMAL for {traffic_class}")
+
+        actions = [final_action]
 
         instructions = [
             parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
@@ -491,14 +498,25 @@ class QoSRyuController(app_manager.RyuApp):
         datapath.send_msg(mod)
 
         self.stats['policies_applied'] += 1
-        self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority}, out_port={out_port})")
+        self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority})")
+
+        # Send the triggering packet out using the SAME action
+        if data:
+            out = parser.OFPPacketOut(
+                datapath=datapath,
+                buffer_id=ofproto.OFP_NO_BUFFER,
+                in_port=in_port_val,
+                actions=[final_action],
+                data=data
+            )
+            datapath.send_msg(out)
+            self.logger.debug(f"Sent triggering packet out")
 
     def _install_default_flow(self, datapath, flow_key, in_port):
         self.flow_classifications[flow_key] = 'default'
         self._install_qos_flow(datapath, flow_key, in_port, 'default', None, None)
 
     def _forward_normal(self, datapath, in_port, data):
-        """Flood a single packet without installing a flow"""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
