@@ -15,7 +15,7 @@ from collections import defaultdict, Counter
 
 ML_API_URL = "http://localhost:8000/classify"
 FLOW_SAMPLES = 30
-FEATURE_TIMEOUT = 5
+FEATURE_TIMEOUT = 30  # Increased from 5 to 30 seconds
 
 TCP_FIN = 0x01
 TCP_SYN = 0x02
@@ -90,17 +90,14 @@ class FlowBuffer:
         self.origin_src = None
         self.src_ip = None
 
-        # FIXED: Proper indentation (8 spaces)
         self.bytes_fwd = 0
         self.bytes_rev = 0
         self.packets_fwd = 0
         self.packets_rev = 0
 
-        # TCP flags per direction
         self.tcp_flags_fwd = Counter()
         self.tcp_flags_rev = Counter()
 
-        # PPI sequence tracking
         self.ppi_roundtrips = 0
         self.last_dir = None
 
@@ -219,6 +216,10 @@ class QoSRyuController(app_manager.RyuApp):
 
         self.flow_buffers = {}
         self.flow_classifications = {}
+        self.datapaths = {}
+
+        # MAC learning table: {datapath_id: {mac: port}}
+        self.mac_to_port = {}
 
         self.stats = {
             'flows_classified': 0,
@@ -233,6 +234,7 @@ class QoSRyuController(app_manager.RyuApp):
         self.logger.info("QoS Ryu Controller initialized")
         self.logger.info(f"ML API endpoint: {ML_API_URL}")
         self.logger.info(f"Collecting first {FLOW_SAMPLES} packets per flow")
+        self.logger.info(f"Feature timeout: {FEATURE_TIMEOUT} seconds")
         self.logger.info("=" * 60)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -241,10 +243,15 @@ class QoSRyuController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
+        self.datapaths[datapath.id] = datapath
+        self.mac_to_port.setdefault(datapath.id, {})
+
         self.logger.info(f"Switch {datapath.id} connected")
 
-        #self._install_meters(datapath)
+        # Meters disabled
+        # self._install_meters(datapath)
 
+        # Default: send all unmatched packets to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
@@ -257,7 +264,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod)
 
-        # ARP flood flow (for ping to work)
+        # ARP flood flow
         match_arp = parser.OFPMatch(eth_type=0x0806)
         actions_arp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst_arp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_arp)]
@@ -271,7 +278,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod_arp)
 
-        # ICMP flood flow (for ping to work)
+        # ICMP flood flow
         match_icmp = parser.OFPMatch(eth_type=0x0800, ip_proto=1)
         actions_icmp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst_icmp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_icmp)]
@@ -285,7 +292,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod_icmp)
 
-        self.logger.info("Default ARP, ICMP  flows installed")
+        self.logger.info("Default, ARP, ICMP flows installed (meters disabled)")
 
     def _install_meters(self, datapath):
         ofproto = datapath.ofproto
@@ -324,7 +331,10 @@ class QoSRyuController(app_manager.RyuApp):
         if not eth:
             return
 
-        # FIXED: Changed to _extract_flow_key (method exists)
+        dpid = datapath.id
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][eth.src] = in_port
+
         flow_key, src_ip, tcp_flags = self._extract_flow_key(pkt, in_port)
 
         if flow_key is None:
@@ -335,21 +345,23 @@ class QoSRyuController(app_manager.RyuApp):
 
         if flow_key in self.flow_classifications:
             traffic_class = self.flow_classifications[flow_key]
-            self._install_qos_flow(datapath, flow_key, in_port, traffic_class, msg.data)
+            self._install_qos_flow(datapath, flow_key, in_port, traffic_class, msg.data, eth.dst)
             return
 
         if flow_key not in self.flow_buffers:
             self.flow_buffers[flow_key] = FlowBuffer(flow_key)
-            self.logger.info(f"New flow detected: {flow_key[:2]}... (total packets: {len(self.flow_buffers)})")
+            self.logger.info(f"New flow from {src_ip} (buffers: {len(self.flow_buffers)})")
 
         buffer = self.flow_buffers[flow_key]
         timestamp = time.time()
         completed = buffer.add_packet(msg.data, timestamp, src_ip, tcp_flags)
 
+        # Forward the packet while collecting
         self._forward_normal(datapath, in_port, msg.data)
         self.logger.debug(f"Flow buffer: {buffer.packet_count()}/{FLOW_SAMPLES} packets")
 
         if completed:
+            self.logger.info(f"Flow collected {FLOW_SAMPLES} packets, classifying...")
             hub.spawn(self._classify_flow, datapath, flow_key, in_port, buffer)
 
     def _extract_flow_key(self, pkt, in_port):
@@ -384,13 +396,12 @@ class QoSRyuController(app_manager.RyuApp):
         flowstats = buffer.get_flowstats()
 
         if not ppi_features:
-            self.logger.warning(f"Insufficient features for {flow_key[:2]}, using default")
+            self.logger.warning(f"Insufficient features, using default")
             self._install_default_flow(datapath, flow_key, in_port)
             if flow_key in self.flow_buffers:
                 del self.flow_buffers[flow_key]
             return
 
-      
         api_payload = {
             'sizes': ppi_features['sizes'],
             'ipts': ppi_features['ipts'],
@@ -403,11 +414,7 @@ class QoSRyuController(app_manager.RyuApp):
 
         try:
             self.stats['api_calls'] += 1
-            response = requests.post(
-                ML_API_URL,
-                json=api_payload,
-                timeout=2
-            )
+            response = requests.post(ML_API_URL, json=api_payload, timeout=2)
 
             if response.status_code == 200:
                 result = response.json()
@@ -418,7 +425,7 @@ class QoSRyuController(app_manager.RyuApp):
                 self.stats['flows_classified'] += 1
 
                 self.flow_classifications[flow_key] = traffic_class
-                self._install_qos_flow(datapath, flow_key, in_port, traffic_class, None)
+                self._install_qos_flow(datapath, flow_key, in_port, traffic_class, None, None)
             else:
                 self.logger.warning(f"API error: {response.status_code}")
                 self._install_default_flow(datapath, flow_key, in_port)
@@ -431,7 +438,7 @@ class QoSRyuController(app_manager.RyuApp):
         if flow_key in self.flow_buffers:
             del self.flow_buffers[flow_key]
 
-    def _install_qos_flow(self, datapath, flow_key, in_port, traffic_class, data):
+    def _install_qos_flow(self, datapath, flow_key, in_port, traffic_class, data, dst_mac=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
@@ -453,9 +460,19 @@ class QoSRyuController(app_manager.RyuApp):
                 match.set_udp_dst(dst_port)
 
         priority = PRIORITY_MAP.get(traffic_class, 4)
-        meter_id = METER_MAP.get(traffic_class, 2)
 
-        actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+        # Determine output port using MAC learning table
+        dpid = datapath.id
+        out_port = ofproto.OFPP_FLOOD  # Default fallback
+
+        if dst_mac and dpid in self.mac_to_port:
+            if dst_mac in self.mac_to_port[dpid]:
+                out_port = self.mac_to_port[dpid][dst_mac]
+                self.logger.debug(f"Using learned port {out_port} for dst_mac {dst_mac}")
+            else:
+                self.logger.debug(f"Unknown dst_mac {dst_mac}, using FLOOD")
+
+        actions = [parser.OFPActionOutput(out_port)]
 
         instructions = [
             parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
@@ -474,38 +491,16 @@ class QoSRyuController(app_manager.RyuApp):
         datapath.send_msg(mod)
 
         self.stats['policies_applied'] += 1
-        self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority}, meter={meter_id})")
+        self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority}, out_port={out_port})")
 
     def _install_default_flow(self, datapath, flow_key, in_port):
         self.flow_classifications[flow_key] = 'default'
-        self._install_qos_flow(datapath, flow_key, in_port, 'default', None)
+        self._install_qos_flow(datapath, flow_key, in_port, 'default', None, None)
 
     def _forward_normal(self, datapath, in_port, data):
+        """Flood a single packet without installing a flow"""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
-        pkt = packet.Packet(data)
-        eth = pkt.get_protocol(ethernet.ethernet)
-
-        if eth:
-            eth_type = eth.ethertype
-
-            #Flood flows for non-IPv4 traffic
-            if eth_type != 0x0800:
-                match = parser.OFPMatch(eth_type=eth_type)
-                actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-                instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-                mod = parser.OFPFlowMod(
-                    datapath=datapath,
-                    priority=1,
-                    match=match,
-                    instructions=instructions,
-                    idle_timeout=60,
-                    hard_timeout=300,
-                )
-                datapath.send_msg(mod)
-                self.logger.debug(f"Installed flood flow for eth_type=0x{eth_type:04x}")
-
 
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         out = parser.OFPPacketOut(
@@ -526,7 +521,6 @@ class QoSRyuController(app_manager.RyuApp):
                 if buffer.is_expired():
                     expired.append((flow_key, buffer))
 
-            # FIXED: Proper indentation (not inside if)
             for flow_key, buffer in expired:
                 src_ip = buffer.src_ip if buffer.src_ip else "unknown"
                 self.logger.warning(f"Flow from {src_ip} expired with {buffer.packet_count()} packets")
