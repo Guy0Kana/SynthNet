@@ -5,7 +5,7 @@ SynthNet Web Dashboard
 Real-time visualization of SDN QoS traffic statistics
 """
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, send_from_directory
 from flask_cors import CORS
 import pandas as pd
 import os
@@ -13,34 +13,61 @@ import json
 from datetime import datetime
 import time
 
+# Get the directory where this file is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app = Flask(__name__,
+app = Flask(
+    __name__,
     template_folder=BASE_DIR,
     static_folder=BASE_DIR
-    )
+)
 CORS(app)
 
-LOG_FILE = "../mininet/logs/traffic_gen.csv"
-STATS_FILE = "stats.json"
+LOG_FILE = os.path.join(BASE_DIR, "..", "mininet", "logs", "traffic_gen.csv")
 
-# Traffic type configuration
+# Traffic type configuration - includes all possible profile names
 TRAFFIC_TYPES = {
+    # Base types
     'voip': {'color': '#00e676', 'priority': 10, 'label': 'VoIP'},
+    'cloud': {'color': '#2979ff', 'priority': 9, 'label': 'Cloud/Email'},
     'cloud_email': {'color': '#2979ff', 'priority': 9, 'label': 'Cloud/Email'},
     'dns': {'color': '#00bcd4', 'priority': 8, 'label': 'DNS'},
     'http': {'color': '#ffeb3b', 'priority': 5, 'label': 'HTTP/Web'},
+    'http_burst': {'color': '#ffeb3b', 'priority': 5, 'label': 'HTTP'},
+    'http_burst0': {'color': '#ffeb3b', 'priority': 5, 'label': 'HTTP'},
+    'http_burst1': {'color': '#ffeb3b', 'priority': 5, 'label': 'HTTP'},
+    'http_burst2': {'color': '#ffeb3b', 'priority': 5, 'label': 'HTTP'},
+    'http_burst3': {'color': '#ffeb3b', 'priority': 5, 'label': 'HTTP'},
     'video': {'color': '#ff5722', 'priority': 2, 'label': 'Video'},
     'ftp': {'color': '#ff9800', 'priority': 2, 'label': 'FTP'},
     'background': {'color': '#78909c', 'priority': 1, 'label': 'Background'},
+    'background_chunk': {'color': '#78909c', 'priority': 1, 'label': 'Background'},
+    'background_chunk0': {'color': '#78909c', 'priority': 1, 'label': 'Background'},
+    'background_chunk1': {'color': '#78909c', 'priority': 1, 'label': 'Background'},
+    'background_chunk2': {'color': '#78909c', 'priority': 1, 'label': 'Background'},
     'p2p': {'color': '#e91e63', 'priority': 1, 'label': 'P2P'},
+    'ping': {'color': '#4dd0e1', 'priority': 8, 'label': 'Ping/ICMP'},
 }
 
 PRIORITY_ORDER = sorted(
-    [(k, v['priority']) for k, v in TRAFFIC_TYPES.items()],
+    [(k, v['priority']) for k, v in TRAFFIC_TYPES.items() if k in ['voip', 'cloud_email', 'dns', 'http', 'video', 'ftp', 'background', 'p2p']],
     key=lambda x: x[1],
     reverse=True
 )
+
+def normalize_profile(profile):
+    """Normalize profile names for grouping"""
+    if not profile:
+        return 'unknown'
+    if profile.startswith('http_burst'):
+        return 'http'
+    if profile.startswith('background_chunk'):
+        return 'background'
+    if profile == 'cloud':
+        return 'cloud_email'
+    if profile == 'ping':
+        return 'dns'
+    return profile
 
 @app.route('/')
 def index():
@@ -61,15 +88,31 @@ def serve_js():
 def get_stats():
     """Get traffic statistics"""
     try:
-        # Read CSV if it exists
         if os.path.exists(LOG_FILE):
             df = pd.read_csv(LOG_FILE)
+            
+            if len(df) == 0:
+                return jsonify({
+                    'success': True,
+                    'latest': [],
+                    'totals': {},
+                    'total_flows': 0,
+                    'last_update': None,
+                    'traffic_types': TRAFFIC_TYPES,
+                    'priority_order': PRIORITY_ORDER
+                })
+            
+            # Normalize profiles for grouping
+            df['normalized_profile'] = df['profile'].apply(normalize_profile)
             
             # Get latest entries
             latest = df.tail(20).to_dict('records')
             
-            # Calculate totals by profile
-            totals = df.groupby('profile')['mbps'].sum().to_dict()
+            # Calculate totals by normalized profile
+            totals = df.groupby('normalized_profile')['mbps'].sum().to_dict()
+            
+            # Also get raw profile totals for display
+            raw_totals = df.groupby('profile')['mbps'].sum().to_dict()
             
             # Get latest timestamp
             latest_time = df['timestamp'].max() if not df.empty else None
@@ -78,6 +121,7 @@ def get_stats():
                 'success': True,
                 'latest': latest,
                 'totals': totals,
+                'raw_totals': raw_totals,
                 'total_flows': len(df),
                 'last_update': latest_time,
                 'traffic_types': TRAFFIC_TYPES,
@@ -101,9 +145,7 @@ def get_stats():
 
 @app.route('/api/flows')
 def get_flows():
-    """Get installed OpenFlow flows (from Ryu)"""
-    # This would query Ryu's REST API if enabled
-    # For now, return sample data
+    """Get installed OpenFlow flows"""
     sample_flows = [
         {'priority': 10, 'type': 'voip', 'src': '10.0.0.1', 'dst': '10.0.0.10', 'action': 'NORMAL'},
         {'priority': 5, 'type': 'http', 'src': '10.0.0.3', 'dst': '10.0.0.10', 'action': 'NORMAL'},
@@ -118,7 +160,6 @@ def get_flows():
 def clear_stats():
     """Clear statistics"""
     if os.path.exists(LOG_FILE):
-        # Backup and clear
         backup = f"{LOG_FILE}.bak"
         os.rename(LOG_FILE, backup)
     return jsonify({'success': True})
