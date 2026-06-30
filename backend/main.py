@@ -27,7 +27,7 @@ NUM_CESNET_CLASSES = 191
 
 CESNET_TO_CAMPUS = {
     'voip': ['voip', 'sip', 'rtp', 'voip_audio', 'voip_video', 'skype_audio',
-             'zoom_audio', 'teams_audio', 'whatsapp_call', 'facetime_audio'],
+             'zoom_audio', 'teams_audio', 'whatsapp_call', 'facetime_audio', 'class_11'],
     
     'cloud_email': ['cloud', 'email', 'imap', 'pop3', 'smtp', 'gmail', 'outlook',
                     'icloud', 'dropbox', 'google_drive', 'onedrive', 'sharepoint',
@@ -314,7 +314,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        log_level="info"
+        reload=False,
+        log_level="info",
         workers=4
     )
