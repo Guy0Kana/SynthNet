@@ -392,7 +392,7 @@ class QoSRyuController(app_manager.RyuApp):
 
         try:
             self.stats['api_calls'] += 1
-            response = requests.post(ML_API_URL, json=api_payload, timeout=2)
+            response = requests.post(ML_API_URL, json=api_payload, timeout=5)
 
             if response.status_code == 200:
                 result = response.json()
