@@ -361,8 +361,7 @@ def run_voip_vs_web(duration=60, with_qos=True):
 
 
 def run_stress_test(duration=60, streams=5, with_qos=True):
-    """High load - 5 parallel TCP streams from each of h1-h4 concurrently,
-    while VoIP/Cloud QoS classes remain protected if with_qos=True."""
+    """High load - 5 parallel TCP streams from each of h1-h4 concurrently"""
     print("\n" + "="*50)
     print(f"  STRESS TEST  |  {streams} streams x 4 hosts  |  {duration}s")
     print("="*50 + "\n")
@@ -370,17 +369,23 @@ def run_stress_test(duration=60, streams=5, with_qos=True):
     if with_qos:
         setup_qos()
 
-    def _stress(host, name):
-        print(f"[Stress]        {name}  ({streams} parallel TCP streams)")
-        out = host.cmd(f"iperf3 -c {_server_ip()} -P {streams} -t {duration} --json")
+    def _stress(host, name, port):
+        print(f"[Stress]        {name}  ({streams} parallel TCP streams) -> port {port}")
+        out = host.cmd(f"iperf3 -c {_server_ip()} -p {port} -P {streams} -t {duration} --json")
         _log("stress", host, "tcp", f"{streams}xTCP", out,
              flow_priority="low", qos_class="best-effort")
 
-    hosts = [('h1', _h('h1')), ('h2', _h('h2')), ('h3', _h('h3')), ('h4', _h('h4'))]
+    # Each host uses a different port
+    hosts = [
+        ('h1', _h('h1'), 5201),  # VoIP port
+        ('h2', _h('h2'), 5202),  # Video port
+        ('h3', _h('h3'), 5203),  # HTTP port
+        ('h4', _h('h4'), 5204),  # FTP port
+    ]
 
     _run_concurrent([
-        lambda name=name, host=host: _stress(host, name)
-        for name, host in hosts
+        lambda name=name, host=host, port=port: _stress(host, name, port)
+        for name, host, port in hosts
     ])
 
     print("\n  Stress test done. Call save_logs() to export results.")
