@@ -256,12 +256,14 @@ table tbody tr:hover {
 
 .badge-voip { background: rgba(0, 230, 118, 0.2); color: #00e676; }
 .badge-cloud_email { background: rgba(41, 121, 255, 0.2); color: #2979ff; }
+.badge-cloud { background: rgba(41, 121, 255, 0.2); color: #2979ff; }
 .badge-dns { background: rgba(0, 188, 212, 0.2); color: #00bcd4; }
 .badge-http { background: rgba(255, 235, 59, 0.2); color: #ffeb3b; }
 .badge-video { background: rgba(255, 87, 34, 0.2); color: #ff5722; }
 .badge-ftp { background: rgba(255, 152, 0, 0.2); color: #ff9800; }
 .badge-background { background: rgba(120, 144, 156, 0.2); color: #78909c; }
 .badge-p2p { background: rgba(233, 30, 99, 0.2); color: #e91e63; }
+.badge-ping { background: rgba(77, 208, 225, 0.2); color: #4dd0e1; }
 
 /* Distribution Bars */
 .distribution-bars {
@@ -277,7 +279,7 @@ table tbody tr:hover {
 }
 
 .bar-label {
-    width: 100px;
+    width: 120px;
     font-size: 13px;
     font-weight: 500;
     color: #e0e6ed;
@@ -355,7 +357,7 @@ footer {
     }
     
     .bar-label {
-        width: 70px;
+        width: 80px;
         font-size: 11px;
     }
     
