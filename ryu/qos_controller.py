@@ -263,7 +263,7 @@ class QoSRyuController(app_manager.RyuApp):
 
         # ARP flood flow
         match_arp = parser.OFPMatch(eth_type=0x0806)
-        actions_arp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        actions_arp = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
         inst_arp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_arp)]
         mod_arp = parser.OFPFlowMod(
             datapath=datapath,
@@ -277,7 +277,7 @@ class QoSRyuController(app_manager.RyuApp):
 
         # ICMP flood flow
         match_icmp = parser.OFPMatch(eth_type=0x0800, ip_proto=1)
-        actions_icmp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        actions_icmp = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
         inst_icmp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_icmp)]
         mod_icmp = parser.OFPFlowMod(
             datapath=datapath,
@@ -416,13 +416,13 @@ class QoSRyuController(app_manager.RyuApp):
         if flow_key in self.flow_buffers:
             del self.flow_buffers[flow_key]
 
-   def _install_qos_flow(self, datapath, flow_key, in_port, traffic_class, data, dst_mac=None):
-       ofproto = datapath.ofproto
-       parser = datapath.ofproto_parser
+    def _install_qos_flow(self, datapath, flow_key, in_port, traffic_class, data, dst_mac=None):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
 
-       src_ip, dst_ip, src_port, dst_port, protocol, in_port_val = flow_key
+        src_ip, dst_ip, src_port, dst_port, protocol, in_port_val = flow_key
 
-        # SIMPLEST MATCH: Only IP addresses (no protocol, no ports)
+        # SIMPLEST MATCH: Only IP addresses
         match = parser.OFPMatch(
             eth_type=0x0800,
             ipv4_src=src_ip,
@@ -451,9 +451,9 @@ class QoSRyuController(app_manager.RyuApp):
         datapath.send_msg(mod)
 
         self.stats['policies_applied'] += 1
-        self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority}, action=NORMAL)")
+        self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority})")
 
-    # Send the triggering packet out
+        # Send the triggering packet out
         if data:
             out = parser.OFPPacketOut(
                 datapath=datapath,
@@ -462,7 +462,7 @@ class QoSRyuController(app_manager.RyuApp):
                 actions=actions,
                 data=data
             )
-            datapath.send_msg(out)l
+            datapath.send_msg(out)
 
     def _install_default_flow(self, datapath, flow_key, in_port, dst_mac=None):
         self.flow_classifications[flow_key] = 'default'
@@ -472,7 +472,7 @@ class QoSRyuController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=ofproto.OFP_NO_BUFFER,
