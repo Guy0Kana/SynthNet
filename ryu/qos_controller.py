@@ -87,6 +87,7 @@ class FlowBuffer:
         self.start_time = time.time()
         self.timeout = timeout
         self.completed = False
+        self.completed_dispatched = False  # Prevent duplicate classification spawns
         self.origin_src = None
         self.src_ip = None
 
@@ -142,6 +143,14 @@ class FlowBuffer:
 
     def is_expired(self):
         return (time.time() - self.start_time) > self.timeout
+
+    def mark_dispatched(self):
+        """Mark that classification has been triggered for this buffer"""
+        self.completed_dispatched = True
+
+    def is_dispatched(self):
+        """Check if classification has already been triggered"""
+        return self.completed_dispatched
 
     def get_flowstats(self):
         duration = time.time() - self.start_time
@@ -315,7 +324,7 @@ class QoSRyuController(app_manager.RyuApp):
             self._forward_normal(datapath, in_port, msg.data)
             return
 
-        # IGNORE REVERSE TRAFFIC FROM SERVER
+        # IGNORE REVERSE TRAFFIC FROM SERVER (only classify client->server)
         if flow_key[0] == "10.0.0.10":
             self._forward_normal(datapath, in_port, msg.data)
             return
@@ -336,9 +345,10 @@ class QoSRyuController(app_manager.RyuApp):
         completed = buffer.add_packet(msg.data, timestamp, src_ip, tcp_flags)
 
         self._forward_normal(datapath, in_port, msg.data)
-        self.logger.debug(f"Flow buffer: {buffer.packet_count()}/{FLOW_SAMPLES} packets")
 
-        if completed:
+        # Only spawn classification once, even if more packets arrive
+        if completed and not buffer.is_dispatched():
+            buffer.mark_dispatched()
             self.logger.info(f"Flow collected {FLOW_SAMPLES} packets, classifying...")
             hub.spawn(self._classify_flow, datapath, flow_key, in_port, buffer, eth.dst)
 
@@ -421,37 +431,114 @@ class QoSRyuController(app_manager.RyuApp):
         parser = datapath.ofproto_parser
 
         src_ip, dst_ip, src_port, dst_port, protocol, in_port_val = flow_key
-
-        # SIMPLEST MATCH: Only IP addresses
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src=src_ip,
-            ipv4_dst=dst_ip,
-        )
-
         priority = PRIORITY_MAP.get(traffic_class, 4)
 
-        # Use OFPP_NORMAL - let OVS handle forwarding
-        actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+        # Determine output port from MAC learning table
+        dpid = datapath.id
+        out_port = None
 
-        instructions = [
-            parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)
-        ]
+        if dst_mac and dpid in self.mac_to_port:
+            if dst_mac in self.mac_to_port[dpid]:
+                out_port = self.mac_to_port[dpid][dst_mac]
 
-        mod = parser.OFPFlowMod(
+        # Use NORMAL if port not learned, otherwise specific port
+        if out_port is not None:
+            actions = [parser.OFPActionOutput(out_port)]
+        else:
+            actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+
+        instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        # Build matches with full 5-tuple for granular QoS
+        if src_port and dst_port and src_port > 0 and dst_port > 0:
+            if protocol == 6:  # TCP
+                match_fwd = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=6,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                    tcp_src=src_port,
+                    tcp_dst=dst_port,
+                )
+                match_rev = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=6,
+                    ipv4_src=dst_ip,
+                    ipv4_dst=src_ip,
+                    tcp_src=dst_port,
+                    tcp_dst=src_port,
+                )
+            elif protocol == 17:  # UDP
+                match_fwd = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=17,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                    udp_src=src_port,
+                    udp_dst=dst_port,
+                )
+                match_rev = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=17,
+                    ipv4_src=dst_ip,
+                    ipv4_dst=src_ip,
+                    udp_src=dst_port,
+                    udp_dst=src_port,
+                )
+            else:
+                match_fwd = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=protocol,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                )
+                match_rev = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=protocol,
+                    ipv4_src=dst_ip,
+                    ipv4_dst=src_ip,
+                )
+        else:
+            # IP-only match if no port info
+            match_fwd = parser.OFPMatch(
+                eth_type=0x0800,
+                ip_proto=protocol,
+                ipv4_src=src_ip,
+                ipv4_dst=dst_ip,
+            )
+            match_rev = parser.OFPMatch(
+                eth_type=0x0800,
+                ip_proto=protocol,
+                ipv4_src=dst_ip,
+                ipv4_dst=src_ip,
+            )
+
+        # Install forward direction: client -> server
+        mod_fwd = parser.OFPFlowMod(
             datapath=datapath,
             priority=priority,
-            match=match,
+            match=match_fwd,
             instructions=instructions,
             idle_timeout=60,
             hard_timeout=300,
             buffer_id=ofproto.OFP_NO_BUFFER,
         )
+        datapath.send_msg(mod_fwd)
 
-        datapath.send_msg(mod)
+        # Install reverse direction: server -> client (same priority/QoS class)
+        mod_rev = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match_rev,
+            instructions=instructions,
+            idle_timeout=60,
+            hard_timeout=300,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+        )
+        datapath.send_msg(mod_rev)
 
         self.stats['policies_applied'] += 1
-        self.logger.info(f"Installed QoS flow: {traffic_class} (priority={priority})")
+        self.logger.info(f"Installed QoS flow (both directions): {traffic_class} (priority={priority})")
 
         # Send the triggering packet out
         if data:
