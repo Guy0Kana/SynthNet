@@ -10,13 +10,25 @@ const REFRESH_INTERVAL = 3000;
 const COLORS = {
     'voip': '#00e676',
     'cloud_email': '#2979ff',
+    'cloud': '#2979ff',
     'dns': '#00bcd4',
     'http': '#ffeb3b',
     'video': '#ff5722',
     'ftp': '#ff9800',
     'background': '#78909c',
     'p2p': '#e91e63',
+    'ping': '#4dd0e1',
 };
+
+// Normalize profile names
+function normalizeProfile(profile) {
+    if (!profile) return 'unknown';
+    if (profile.startsWith('http_burst')) return 'http';
+    if (profile.startsWith('background_chunk')) return 'background';
+    if (profile === 'cloud') return 'cloud_email';
+    if (profile === 'ping') return 'dns';
+    return profile;
+}
 
 function formatBandwidth(mbps) {
     if (mbps >= 1000) return `${(mbps / 1000).toFixed(2)} Gbps`;
@@ -36,17 +48,37 @@ function formatTime(timestamp) {
 }
 
 function getBadgeClass(profile) {
+    const normalized = normalizeProfile(profile);
     const mapping = {
         'voip': 'badge-voip',
         'cloud_email': 'badge-cloud_email',
+        'cloud': 'badge-cloud',
         'dns': 'badge-dns',
         'http': 'badge-http',
         'video': 'badge-video',
         'ftp': 'badge-ftp',
         'background': 'badge-background',
         'p2p': 'badge-p2p',
+        'ping': 'badge-ping',
     };
-    return mapping[profile] || 'badge-background';
+    return mapping[normalized] || 'badge-background';
+}
+
+function getProfileDisplay(profile) {
+    const normalized = normalizeProfile(profile);
+    const labels = {
+        'voip': 'VoIP',
+        'cloud_email': 'Cloud/Email',
+        'cloud': 'Cloud/Email',
+        'dns': 'DNS',
+        'http': 'HTTP/Web',
+        'video': 'Video',
+        'ftp': 'FTP',
+        'background': 'Background',
+        'p2p': 'P2P',
+        'ping': 'Ping/ICMP',
+    };
+    return labels[normalized] || profile;
 }
 
 function updateDashboard(data) {
@@ -55,19 +87,28 @@ function updateDashboard(data) {
         return;
     }
 
+    // Update total flows
     document.getElementById('totalFlows').textContent = data.total_flows || 0;
     
-    const activeTypes = Object.keys(data.totals).filter(k => data.totals[k] > 0).length;
-    document.getElementById('activeTypes').textContent = activeTypes;
+    // Count active normalized profiles
+    const activeProfiles = new Set();
+    for (const [profile, mbps] of Object.entries(data.totals)) {
+        if (mbps > 0) {
+            activeProfiles.add(normalizeProfile(profile));
+        }
+    }
+    document.getElementById('activeTypes').textContent = activeProfiles.size;
     
+    // Find highest priority active
     let highest = '-';
     let highestPri = -1;
     for (const [profile, mbps] of Object.entries(data.totals)) {
-        if (mbps > 0 && data.traffic_types[profile]) {
-            const pri = data.traffic_types[profile].priority;
-            if (pri > highestPri) {
-                highestPri = pri;
-                highest = data.traffic_types[profile].label;
+        if (mbps > 0) {
+            const normalized = normalizeProfile(profile);
+            const info = data.traffic_types[normalized] || data.traffic_types[profile];
+            if (info && info.priority > highestPri) {
+                highestPri = info.priority;
+                highest = info.label || normalized;
             }
         }
     }
@@ -89,7 +130,14 @@ function updatePriorityGrid(data) {
         const info = data.traffic_types[profile];
         if (!info) continue;
         const color = info.color || '#666';
-        const active = data.totals[profile] > 0;
+        // Check if any data matches this profile
+        let active = false;
+        for (const [p, mbps] of Object.entries(data.totals)) {
+            if (normalizeProfile(p) === profile && mbps > 0) {
+                active = true;
+                break;
+            }
+        }
         html += `
             <div class="priority-item" style="border-color: ${active ? color : '#1a2636'}; opacity: ${active ? 1 : 0.5}">
                 <div class="color-bar" style="background: ${color}"></div>
@@ -116,18 +164,19 @@ function updateTrafficTable(entries) {
     let html = '';
     for (const row of latestEntries) {
         const profile = row.profile || 'unknown';
+        const displayName = getProfileDisplay(profile);
         const badgeClass = getBadgeClass(profile);
         const priority = row.flow_priority || '-';
         
         html += `
             <tr>
                 <td>${formatTime(row.timestamp)}</td>
-                <td><span class="badge ${badgeClass}">${profile}</span></td>
+                <td><span class="badge ${badgeClass}">${displayName}</span></td>
                 <td>${row.host || '-'}</td>
                 <td>${row.protocol || '-'}</td>
                 <td>${formatBandwidth(row.mbps || 0)}</td>
-                <td>${row.jitter_ms !== 'n/a' ? row.jitter_ms + ' ms' : '-'}</td>
-                <td>${row.lost_pct !== 'n/a' ? row.lost_pct + '%' : '-'}</td>
+                <td>${row.jitter_ms !== 'n/a' && row.jitter_ms ? row.jitter_ms + ' ms' : '-'}</td>
+                <td>${row.lost_pct !== 'n/a' && row.lost_pct ? row.lost_pct + '%' : '-'}</td>
                 <td>${priority}</td>
             </tr>
         `;
@@ -139,7 +188,16 @@ function updateDistribution(totals) {
     const container = document.getElementById('distributionBars');
     if (!container) return;
 
-    const entries = Object.entries(totals).filter(([_, v]) => v > 0);
+    // Group by normalized profile
+    const grouped = {};
+    for (const [profile, mbps] of Object.entries(totals)) {
+        if (mbps > 0) {
+            const normalized = normalizeProfile(profile);
+            grouped[normalized] = (grouped[normalized] || 0) + mbps;
+        }
+    }
+
+    const entries = Object.entries(grouped);
     
     if (entries.length === 0) {
         container.innerHTML = '<div style="padding:20px;text-align:center;color:#8892a8;">No traffic data available</div>';
@@ -151,14 +209,14 @@ function updateDistribution(totals) {
     for (const [profile, mbps] of entries) {
         const color = COLORS[profile] || '#666';
         const percentage = maxVal > 0 ? Math.max((mbps / maxVal) * 100, 5) : 0;
-        const label = profile.charAt(0).toUpperCase() + profile.slice(1);
+        const label = getProfileDisplay(profile);
         
         html += `
             <div class="bar-row">
                 <span class="bar-label">${label}</span>
                 <div class="bar-track">
                     <div class="bar-fill" style="width: ${percentage}%; background: ${color}">
-                        ${mbps >= 1 ? mbps.toFixed(1) + ' Mbps' : mbps.toFixed(3) + ' Mbps'}
+                        ${formatBandwidth(mbps)}
                     </div>
                 </div>
                 <span class="bar-value">${formatBandwidth(mbps)}</span>
