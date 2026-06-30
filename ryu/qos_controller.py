@@ -248,9 +248,6 @@ class QoSRyuController(app_manager.RyuApp):
 
         self.logger.info(f"Switch {datapath.id} connected")
 
-        # Meters disabled
-        # self._install_meters(datapath)
-
         # Default: send all unmatched packets to controller
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
@@ -292,30 +289,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod_icmp)
 
-        self.logger.info("Default, ARP, ICMP flows installed (meters disabled)")
-
-    def _install_meters(self, datapath):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        meter_configs = [
-            (1, 1000000, 100000),
-            (2, 500000, 50000),
-            (3, 100000, 10000),
-            (4, 50000, 5000),
-        ]
-
-        for meter_id, rate, burst in meter_configs:
-            meter_mod = parser.OFPMeterMod(
-                datapath=datapath,
-                command=ofproto.OFPMC_ADD,
-                flags=ofproto.OFPMF_KBPS,
-                meter_id=meter_id,
-                bands=[parser.OFPMeterBandDrop(rate=rate, burst_size=burst)]
-            )
-            datapath.send_msg(meter_mod)
-
-        self.logger.info("Meter tables installed (IDs 1-4)")
+        self.logger.info("Default, ARP, ICMP flows installed")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -448,21 +422,41 @@ class QoSRyuController(app_manager.RyuApp):
 
         src_ip, dst_ip, src_port, dst_port, protocol, in_port_val = flow_key
 
-        # Build match WITHOUT in_port (simpler match)
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ip_proto=protocol,
-            ipv4_src=src_ip,
-            ipv4_dst=dst_ip,
-        )
-
+        # Build match with all fields defined inline
+        # FIXED: No set_tcp_src()/set_tcp_dst() - all fields defined in OFPMatch constructor
         if src_port and dst_port and src_port > 0 and dst_port > 0:
-            if protocol == 6:
-                match.set_tcp_src(src_port)
-                match.set_tcp_dst(dst_port)
-            elif protocol == 17:
-                match.set_udp_src(src_port)
-                match.set_udp_dst(dst_port)
+            if protocol == 6:  # TCP
+                match = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=6,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                    tcp_src=src_port,
+                    tcp_dst=dst_port,
+                )
+            elif protocol == 17:  # UDP
+                match = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=17,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                    udp_src=src_port,
+                    udp_dst=dst_port,
+                )
+            else:
+                match = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ip_proto=protocol,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                )
+        else:
+            match = parser.OFPMatch(
+                eth_type=0x0800,
+                ip_proto=protocol,
+                ipv4_src=src_ip,
+                ipv4_dst=dst_ip,
+            )
 
         priority = PRIORITY_MAP.get(traffic_class, 4)
 
