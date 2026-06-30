@@ -10,8 +10,10 @@ from flask_cors import CORS
 import pandas as pd
 import os
 import json
+import csv
 from datetime import datetime
 import time
+import traceback
 
 # Get the directory where this file is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -88,46 +90,8 @@ def serve_js():
 def get_stats():
     """Get traffic statistics"""
     try:
-        if os.path.exists(LOG_FILE):
-            df = pd.read_csv(LOG_FILE)
-            
-            if len(df) == 0:
-                return jsonify({
-                    'success': True,
-                    'latest': [],
-                    'totals': {},
-                    'total_flows': 0,
-                    'last_update': None,
-                    'traffic_types': TRAFFIC_TYPES,
-                    'priority_order': PRIORITY_ORDER
-                })
-            
-            # Normalize profiles for grouping
-            df['normalized_profile'] = df['profile'].apply(normalize_profile)
-            
-            # Get latest entries
-            latest = df.tail(20).to_dict('records')
-            
-            # Calculate totals by normalized profile
-            totals = df.groupby('normalized_profile')['mbps'].sum().to_dict()
-            
-            # Also get raw profile totals for display
-            raw_totals = df.groupby('profile')['mbps'].sum().to_dict()
-            
-            # Get latest timestamp
-            latest_time = df['timestamp'].max() if not df.empty else None
-            
-            return jsonify({
-                'success': True,
-                'latest': latest,
-                'totals': totals,
-                'raw_totals': raw_totals,
-                'total_flows': len(df),
-                'last_update': latest_time,
-                'traffic_types': TRAFFIC_TYPES,
-                'priority_order': PRIORITY_ORDER
-            })
-        else:
+        # Check if file exists
+        if not os.path.exists(LOG_FILE):
             return jsonify({
                 'success': True,
                 'latest': [],
@@ -137,7 +101,102 @@ def get_stats():
                 'traffic_types': TRAFFIC_TYPES,
                 'priority_order': PRIORITY_ORDER
             })
+        
+        # Try reading CSV with different methods
+        df = None
+        
+        # Method 1: Try pandas with error handling
+        try:
+            df = pd.read_csv(LOG_FILE, on_bad_lines='skip')
+            if df.empty:
+                df = None
+        except Exception as e:
+            print(f"Pandas read error: {e}")
+            df = None
+        
+        # Method 2: Try manual CSV reading if pandas fails
+        if df is None or df.empty:
+            try:
+                data = []
+                with open(LOG_FILE, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        # Convert numeric values
+                        for key in ['mbps', 'bytes', 'retransmits', 'lost_packets']:
+                            if key in row and row[key]:
+                                try:
+                                    row[key] = float(row[key])
+                                except:
+                                    row[key] = 0
+                        data.append(row)
+                
+                if data:
+                    df = pd.DataFrame(data)
+            except Exception as e:
+                print(f"CSV manual read error: {e}")
+                df = None
+        
+        # If still no data, return empty
+        if df is None or df.empty:
+            return jsonify({
+                'success': True,
+                'latest': [],
+                'totals': {},
+                'total_flows': 0,
+                'last_update': None,
+                'traffic_types': TRAFFIC_TYPES,
+                'priority_order': PRIORITY_ORDER
+            })
+        
+        # Clean data - replace NaN/None with 0
+        df = df.fillna(0)
+        
+        # Ensure mbps is numeric
+        if 'mbps' in df.columns:
+            df['mbps'] = pd.to_numeric(df['mbps'], errors='coerce').fillna(0)
+        
+        # Normalize profiles for grouping
+        if 'profile' in df.columns:
+            df['normalized_profile'] = df['profile'].apply(normalize_profile)
+        else:
+            df['normalized_profile'] = 'unknown'
+        
+        # Get latest entries (last 20)
+        latest = df.tail(20).to_dict('records')
+        
+        # Clean latest for JSON
+        for row in latest:
+            for key in ['mbps', 'bytes', 'retransmits', 'lost_packets']:
+                if key in row:
+                    if pd.isna(row[key]) or row[key] is None:
+                        row[key] = 0
+                    try:
+                        row[key] = float(row[key])
+                    except:
+                        row[key] = 0
+        
+        # Calculate totals by normalized profile
+        totals = df.groupby('normalized_profile')['mbps'].sum().to_dict()
+        
+        # Clean totals
+        totals = {k: float(v) if not pd.isna(v) else 0 for k, v in totals.items()}
+        
+        # Get latest timestamp
+        latest_time = df['timestamp'].max() if 'timestamp' in df.columns and not df.empty else None
+        
+        return jsonify({
+            'success': True,
+            'latest': latest,
+            'totals': totals,
+            'total_flows': len(df),
+            'last_update': latest_time,
+            'traffic_types': TRAFFIC_TYPES,
+            'priority_order': PRIORITY_ORDER
+        })
+        
     except Exception as e:
+        print(f"Error in /api/stats: {e}")
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e)
@@ -168,9 +227,12 @@ def clear_stats():
 def export_stats():
     """Export stats as JSON"""
     if os.path.exists(LOG_FILE):
-        df = pd.read_csv(LOG_FILE)
-        data = df.to_dict('records')
-        return jsonify(data)
+        try:
+            df = pd.read_csv(LOG_FILE)
+            data = df.to_dict('records')
+            return jsonify(data)
+        except:
+            return jsonify([])
     return jsonify([])
 
 if __name__ == '__main__':
