@@ -87,7 +87,7 @@ class FlowBuffer:
         self.start_time = time.time()
         self.timeout = timeout
         self.completed = False
-        self.completed_dispatched = False  # Prevent duplicate classification spawns
+        self.completed_dispatched = False
         self.origin_src = None
         self.src_ip = None
 
@@ -145,11 +145,9 @@ class FlowBuffer:
         return (time.time() - self.start_time) > self.timeout
 
     def mark_dispatched(self):
-        """Mark that classification has been triggered for this buffer"""
         self.completed_dispatched = True
 
     def is_dispatched(self):
-        """Check if classification has already been triggered"""
         return self.completed_dispatched
 
     def get_flowstats(self):
@@ -227,7 +225,6 @@ class QoSRyuController(app_manager.RyuApp):
         self.flow_classifications = {}
         self.datapaths = {}
 
-        # MAC learning table: {datapath_id: {mac: port}}
         self.mac_to_port = {}
 
         self.stats = {
@@ -270,9 +267,9 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod)
 
-        # ARP flood flow
+        # ARP flood flow - use FLOOD (OFPP_NORMAL fails in OpenFlow 1.3)
         match_arp = parser.OFPMatch(eth_type=0x0806)
-        actions_arp = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+        actions_arp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst_arp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_arp)]
         mod_arp = parser.OFPFlowMod(
             datapath=datapath,
@@ -284,9 +281,9 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod_arp)
 
-        # ICMP flood flow
+        # ICMP flood flow - use FLOOD
         match_icmp = parser.OFPMatch(eth_type=0x0800, ip_proto=1)
-        actions_icmp = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+        actions_icmp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst_icmp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_icmp)]
         mod_icmp = parser.OFPFlowMod(
             datapath=datapath,
@@ -324,7 +321,7 @@ class QoSRyuController(app_manager.RyuApp):
             self._forward_normal(datapath, in_port, msg.data)
             return
 
-        # IGNORE REVERSE TRAFFIC FROM SERVER (only classify client->server)
+        # IGNORE REVERSE TRAFFIC FROM SERVER
         if flow_key[0] == "10.0.0.10":
             self._forward_normal(datapath, in_port, msg.data)
             return
@@ -346,7 +343,6 @@ class QoSRyuController(app_manager.RyuApp):
 
         self._forward_normal(datapath, in_port, msg.data)
 
-        # Only spawn classification once, even if more packets arrive
         if completed and not buffer.is_dispatched():
             buffer.mark_dispatched()
             self.logger.info(f"Flow collected {FLOW_SAMPLES} packets, classifying...")
@@ -402,7 +398,7 @@ class QoSRyuController(app_manager.RyuApp):
 
         try:
             self.stats['api_calls'] += 1
-            response = requests.post(ML_API_URL, json=api_payload, timeout=10)
+            response = requests.post(ML_API_URL, json=api_payload, timeout=5)
 
             if response.status_code == 200:
                 result = response.json()
@@ -441,11 +437,11 @@ class QoSRyuController(app_manager.RyuApp):
             if dst_mac in self.mac_to_port[dpid]:
                 out_port = self.mac_to_port[dpid][dst_mac]
 
-        # Use NORMAL if port not learned, otherwise specific port
+        # Use FLOOD if port not learned
         if out_port is not None:
             actions = [parser.OFPActionOutput(out_port)]
         else:
-            actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
 
         instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
 
@@ -499,7 +495,6 @@ class QoSRyuController(app_manager.RyuApp):
                     ipv4_dst=src_ip,
                 )
         else:
-            # IP-only match if no port info
             match_fwd = parser.OFPMatch(
                 eth_type=0x0800,
                 ip_proto=protocol,
@@ -513,34 +508,22 @@ class QoSRyuController(app_manager.RyuApp):
                 ipv4_dst=src_ip,
             )
 
-        # Install forward direction: client -> server
-        mod_fwd = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=priority,
-            match=match_fwd,
-            instructions=instructions,
-            idle_timeout=60,
-            hard_timeout=300,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-        )
-        datapath.send_msg(mod_fwd)
-
-        # Install reverse direction: server -> client (same priority/QoS class)
-        mod_rev = parser.OFPFlowMod(
-            datapath=datapath,
-            priority=priority,
-            match=match_rev,
-            instructions=instructions,
-            idle_timeout=60,
-            hard_timeout=300,
-            buffer_id=ofproto.OFP_NO_BUFFER,
-        )
-        datapath.send_msg(mod_rev)
+        # Install forward and reverse flows
+        for match in [match_fwd, match_rev]:
+            mod = parser.OFPFlowMod(
+                datapath=datapath,
+                priority=priority,
+                match=match,
+                instructions=instructions,
+                idle_timeout=60,
+                hard_timeout=300,
+                buffer_id=ofproto.OFP_NO_BUFFER,
+            )
+            datapath.send_msg(mod)
 
         self.stats['policies_applied'] += 1
         self.logger.info(f"Installed QoS flow (both directions): {traffic_class} (priority={priority})")
 
-        # Send the triggering packet out
         if data:
             out = parser.OFPPacketOut(
                 datapath=datapath,
@@ -559,7 +542,7 @@ class QoSRyuController(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=ofproto.OFP_NO_BUFFER,
