@@ -61,7 +61,7 @@ def _log(profile, host, protocol, bw_requested, raw_json, flow_priority='', qos_
         data = json.loads(json_match.group())
 
         if 'error' in data:
-            print(f"  [LOG] {profile} on {host.name}: iperf3 error - {data['error']}")
+            print(f"  [LOG] {profile} on {host.name}: iperf3 error - check server is running")
             return
 
         mbps = 0
@@ -107,12 +107,6 @@ def save_logs():
     print(f"Saved {len(_results)} rows -> {LOG_FILE}")
 
 
-def clear_results():
-    with _lock:
-        _results.clear()
-    print("In-memory results cleared.")
-
-
 def _run_concurrent(fns):
     threads = [threading.Thread(target=fn) for fn in fns]
     for t in threads: t.start()
@@ -120,67 +114,35 @@ def _run_concurrent(fns):
 
 
 # ---------------------------------------------------------------------------
-# QoS setup - dedicated class per traffic type, capped borrowing
+# QoS setup - protects VoIP and Cloud bandwidth
 # ---------------------------------------------------------------------------
-#
-# Previous version put video/web/ftp/background all into the htb "default"
-# class with ceil=100mbit (same as everyone else). That has two effects:
-#   1. VoIP/Cloud only ever send AT their configured target rate (64k / 10M),
-#      which is below their guaranteed floor, so they never need to borrow
-#      and never contend for leftover bandwidth.
-#   2. Whatever's left over goes entirely to the single shared low-priority
-#      class, and web's -P 4 parallel TCP streams dominate it, including
-#      video, which the comments claimed was protected but never was.
-#
-# Fix: give every traffic type its own leaf class, and cap ceil on the
-# low-priority classes so they can't monopolize 100% of idle capacity even
-# when VoIP/Cloud aren't using their reservation.
 
 QOS_PORTS = {
     "voip":  5201,
-    "video": 5202,
-    "web":   5203,
-    "ftp":   5204,
-    "background": 5205,
     "cloud": 5206,
 }
 
-# (classid, rate_pct, ceil_pct, prio)
-QOS_CLASSES = {
-    "voip":       ("1:10", 10, 100, 0),  # EF   - guaranteed floor, may burst to full link
-    "cloud":      ("1:20", 25, 100, 1),  # AF31 - guaranteed floor, may burst to full link
-    "video":      ("1:21", 20,  60, 2),  # AF41 - protected floor, capped borrow
-    "web":        ("1:30", 15,  50, 3),  # best-effort, capped so it can't eat everything idle
-    "ftp":        ("1:31", 15,  50, 3),  # bulk, same tier as web
-    "background": ("1:32",  5,  20, 4),  # lowest priority, small borrow cap
-}
-
-
 def setup_qos():
-    print("Applying QoS (tc/HTB): dedicated class per traffic type...")
+    print("Applying QoS (tc/HTB) to protect VoIP and Cloud bandwidth...")
     for host in net.hosts:
         if host.name == SERVER_HOST:
             continue
         intf = host.defaultIntf().name
         host.cmd(f"tc qdisc del dev {intf} root 2>/dev/null")
-        host.cmd(f"tc qdisc add dev {intf} root handle 1: htb default 32")
+        host.cmd(f"tc qdisc add dev {intf} root handle 1: htb default 30")
         host.cmd(f"tc class add dev {intf} parent 1: classid 1:1 htb rate {LINK_MBIT}mbit")
+        host.cmd(f"tc class add dev {intf} parent 1:1 classid 1:10 htb "
+                  f"rate {max(2, int(LINK_MBIT*0.10))}mbit ceil {LINK_MBIT}mbit prio 0")
+        host.cmd(f"tc class add dev {intf} parent 1:1 classid 1:20 htb "
+                  f"rate {max(5, int(LINK_MBIT*0.25))}mbit ceil {LINK_MBIT}mbit prio 1")
+        host.cmd(f"tc class add dev {intf} parent 1:1 classid 1:30 htb "
+                  f"rate {max(5, int(LINK_MBIT*0.20))}mbit ceil {LINK_MBIT}mbit prio 2")
 
-        for name, (classid, rate_pct, ceil_pct, prio) in QOS_CLASSES.items():
-            rate = max(1, int(LINK_MBIT * rate_pct / 100))
-            ceil = max(rate, int(LINK_MBIT * ceil_pct / 100))
-            host.cmd(f"tc class add dev {intf} parent 1:1 classid {classid} htb "
-                      f"rate {rate}mbit ceil {ceil}mbit prio {prio}")
-            # fq_codel per leaf keeps a single greedy flow (e.g. web's -P 4)
-            # from hogging its own class against its siblings in the same bucket.
-            host.cmd(f"tc qdisc add dev {intf} parent {classid} handle {classid.split(':')[1]}: fq_codel")
-
-            port = QOS_PORTS[name]
-            host.cmd(f"tc filter add dev {intf} parent 1: protocol ip prio {prio+1} u32 "
-                      f"match ip dport {port} 0xffff flowid {classid}")
-
-    print("QoS applied — voip/cloud keep guaranteed floors + full-link burst headroom;")
-    print("video/web/ftp/background get dedicated classes with capped borrow ceilings.")
+        host.cmd(f"tc filter add dev {intf} parent 1: protocol ip prio 1 u32 "
+                  f"match ip dport {QOS_PORTS['voip']} 0xffff flowid 1:10")
+        host.cmd(f"tc filter add dev {intf} parent 1: protocol ip prio 2 u32 "
+                  f"match ip dport {QOS_PORTS['cloud']} 0xffff flowid 1:20")
+    print("QoS applied: VoIP=prio0 (~10% guaranteed), Cloud=prio1 (~25% guaranteed)")
 
 
 def clear_qos():
@@ -191,22 +153,6 @@ def clear_qos():
         intf = host.defaultIntf().name
         host.cmd(f"tc qdisc del dev {intf} root 2>/dev/null")
     print("Done.")
-
-
-# ---------------------------------------------------------------------------
-# Cross-run cleanup — prevents lag from stacking runs
-# ---------------------------------------------------------------------------
-
-def reset_environment(wait=2):
-    """Kill stale iperf3 processes (client AND server side) and clear tc
-    rules before starting a new test. Call this before every composite run —
-    it's what was missing before, and is why a second run would lag/degrade."""
-    print("Resetting environment (killing stale iperf3, clearing tc)...")
-    for host in net.hosts:
-        host.cmd("pkill -9 -f iperf3 2>/dev/null")
-    clear_qos()
-    sleep(wait)  # let TCP sockets/tc teardown settle before reconfiguring
-    print("Environment reset complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +255,6 @@ def run_ping(host, count=10):
 # ---------------------------------------------------------------------------
 
 def run_all_traffic(duration=30, with_qos=True):
-    reset_environment()
-
     print("\n" + "="*50)
     print(f"  ALL Traffic  |  {duration}s  |  server={SERVER_HOST} ({_server_ip()})")
     print("="*50 + "\n")
@@ -334,8 +278,6 @@ def run_all_traffic(duration=30, with_qos=True):
 
 
 def run_voip_vs_web(duration=60, with_qos=True):
-    reset_environment()
-
     print("\n" + "="*50)
     print("  TEST: VoIP (high priority) vs Web (low priority)")
     print("="*50 + "\n")
@@ -354,8 +296,6 @@ def run_voip_vs_web(duration=60, with_qos=True):
 
 
 def run_stress_test(duration=60, streams=5, with_qos=True):
-    reset_environment()
-
     print("\n" + "="*50)
     print(f"  STRESS TEST  |  {streams} streams x 4 hosts  |  {duration}s")
     print("="*50 + "\n")
@@ -386,9 +326,9 @@ def run_stress_test(duration=60, streams=5, with_qos=True):
 
 
 def stop_all_traffic():
-    print("Stopping all iperf3 processes (client + server)...")
+    print("Stopping all iperf3 processes...")
     for host in net.hosts:
-        host.cmd("pkill -9 -f iperf3 2>/dev/null")
+        host.cmd("pkill iperf3")
     print("Done.")
 
 
@@ -399,16 +339,14 @@ def stop_all_traffic():
 print("\n✅ Traffic generator loaded!")
 print(f"  Server: {SERVER_HOST} ({_server_ip()})")
 print("\n📊 QoS Commands:")
-print("  setup_qos()                 - Apply per-class QoS (dedicated class per traffic type)")
+print("  setup_qos()                 - Protect VoIP/Cloud bandwidth")
 print("  clear_qos()                 - Remove tc rules")
-print("  reset_environment()         - Kill stale iperf3 + clear tc (auto-run before composite tests)")
 print("\n🚀 Composite commands:")
 print("  run_all_traffic(30)         - All 6 traffic types")
 print("  run_voip_vs_web(60)         - VoIP vs Web priority test")
 print("  run_stress_test(60)         - High load stress test")
 print("  stop_all_traffic()          - Kill all iperf3 processes")
 print("  save_logs()                 - Export results to CSV")
-print("  clear_results()             - Wipe in-memory results between test batches")
 print("\nIndividual commands:")
 print("  run_voip(h1)                - VoIP on h1")
 print("  run_video(h2)               - Video on h2")
