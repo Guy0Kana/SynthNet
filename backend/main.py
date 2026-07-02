@@ -27,7 +27,7 @@ NUM_CESNET_CLASSES = 191
 
 CESNET_TO_CAMPUS = {
     'voip': ['voip', 'sip', 'rtp', 'voip_audio', 'voip_video', 'skype_audio',
-             'zoom_audio', 'teams_audio', 'whatsapp_call', 'facetime_audio', 'class_11'],
+             'zoom_audio', 'teams_audio', 'whatsapp_call', 'facetime_audio'],
     
     'cloud_email': ['cloud', 'email', 'imap', 'pop3', 'smtp', 'gmail', 'outlook',
                     'icloud', 'dropbox', 'google_drive', 'onedrive', 'sharepoint',
@@ -64,7 +64,7 @@ PRIORITY_MAP = {
 }
 
 # ============================================================================
-# PPI Transform
+# PPI Transform - FIXED: Correct channel order
 # ============================================================================
 
 class PPITransform:
@@ -76,10 +76,13 @@ class PPITransform:
     
     def __call__(self, tensor):
         t = tensor.clone()
-        t[:, 0, :] = (t[:, 0, :] - self.psize_mean) / self.psize_scale
+        # Channel 0 = IPT (inter-packet times)
+        t[:, 0, :] = (t[:, 0, :] - self.ipt_mean) / self.ipt_scale
         t[:, 0, :] = torch.clamp(t[:, 0, :], min=-1.0, max=1.0)
-        t[:, 1, :] = (t[:, 1, :] - self.ipt_mean) / self.ipt_scale
+        # Channel 1 = DIR (directions, already -1/0/1, just clamp)
         t[:, 1, :] = torch.clamp(t[:, 1, :], min=-1.0, max=1.0)
+        # Channel 2 = SIZE (packet sizes)
+        t[:, 2, :] = (t[:, 2, :] - self.psize_mean) / self.psize_scale
         t[:, 2, :] = torch.clamp(t[:, 2, :], min=-1.0, max=1.0)
         return t
 
@@ -134,9 +137,11 @@ class TrafficClassifier:
             return f"class_{class_id}"
     
     def predict(self, sizes, ipts, dirs, flowstats):
-        # Build PPI tensor: (1, 3, 30)
+        # FIXED: Build PPI tensor with correct channel order: IPT, DIR, SIZE
         ppi_tensor = torch.tensor([
-            sizes, ipts, dirs
+            ipts,   # channel 0 = IPT (inter-packet times)
+            dirs,   # channel 1 = DIR (directions)
+            sizes   # channel 2 = SIZE (packet sizes)
         ], dtype=torch.float32).unsqueeze(0)
         
         ppi_tensor = self.ppi_transform(ppi_tensor)
@@ -314,7 +319,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=False,
-        log_level="info",
-        workers=4
+        reload=False,  # Disabled for single worker
+        log_level="info"
+        # Single worker to avoid reloading model 4 times
     )
