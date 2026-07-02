@@ -10,7 +10,7 @@ SERVER_HOST = "server"
 LOG_FILE    = "logs/traffic_gen.csv"
 
 # Link capacity assumption for QoS shaping
-LINK_MBIT = 100
+LINK_MBIT = 1000  # 1 Gbps link
 
 _results = []
 _lock    = threading.Lock()
@@ -128,21 +128,26 @@ def setup_qos():
         if host.name == SERVER_HOST:
             continue
         intf = host.defaultIntf().name
+        # Clear existing QoS first
         host.cmd(f"tc qdisc del dev {intf} root 2>/dev/null")
         host.cmd(f"tc qdisc add dev {intf} root handle 1: htb default 30")
         host.cmd(f"tc class add dev {intf} parent 1: classid 1:1 htb rate {LINK_MBIT}mbit")
+        
+        # VoIP: 30% guaranteed (highest priority)
         host.cmd(f"tc class add dev {intf} parent 1:1 classid 1:10 htb "
-                  f"rate {max(2, int(LINK_MBIT*0.10))}mbit ceil {LINK_MBIT}mbit prio 0")
+                  f"rate {max(10, int(LINK_MBIT*0.30))}mbit ceil {LINK_MBIT}mbit prio 0")
+        # Cloud: 40% guaranteed (high priority)
         host.cmd(f"tc class add dev {intf} parent 1:1 classid 1:20 htb "
-                  f"rate {max(5, int(LINK_MBIT*0.25))}mbit ceil {LINK_MBIT}mbit prio 1")
+                  f"rate {max(10, int(LINK_MBIT*0.40))}mbit ceil {LINK_MBIT}mbit prio 1")
+        # Best effort: 10% guaranteed (low priority)
         host.cmd(f"tc class add dev {intf} parent 1:1 classid 1:30 htb "
-                  f"rate {max(5, int(LINK_MBIT*0.20))}mbit ceil {LINK_MBIT}mbit prio 2")
+                  f"rate {max(5, int(LINK_MBIT*0.10))}mbit ceil {LINK_MBIT}mbit prio 2")
 
         host.cmd(f"tc filter add dev {intf} parent 1: protocol ip prio 1 u32 "
                   f"match ip dport {QOS_PORTS['voip']} 0xffff flowid 1:10")
         host.cmd(f"tc filter add dev {intf} parent 1: protocol ip prio 2 u32 "
                   f"match ip dport {QOS_PORTS['cloud']} 0xffff flowid 1:20")
-    print("QoS applied: VoIP=prio0 (~10% guaranteed), Cloud=prio1 (~25% guaranteed)")
+    print("QoS applied: VoIP=prio0 (30% guaranteed), Cloud=prio1 (40% guaranteed), rest=best-effort (10%)")
 
 
 def clear_qos():
@@ -160,18 +165,21 @@ def clear_qos():
 # ---------------------------------------------------------------------------
 
 def run_voip(host, duration=30):
+    """VoIP - 10 Mbps UDP (high-quality video call) to show QoS protection clearly"""
     print(f"[VoIP]          {host.name} -> server:5201  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5201 -u -b 64k -l 128 -t {duration} --json")
-    _log("voip", host, "udp", "64k", out, flow_priority="high", qos_class="EF")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5201 -u -b 10M -l 1400 -t {duration} --json")
+    _log("voip", host, "udp", "10M", out, flow_priority="high", qos_class="EF")
 
 
 def run_video(host, duration=30):
+    """HD video stream - 5 Mbps UDP, 1400-byte packets"""
     print(f"[Video]         {host.name} -> server:5202  ({duration}s)")
     out = host.cmd(f"iperf3 -c {_server_ip()} -p 5202 -u -b 5M -l 1400 -t {duration} --json")
     _log("video", host, "udp", "5M", out, flow_priority="medium", qos_class="AF41")
 
 
 def run_web(host, duration=30):
+    """Web browsing - bursty TCP with idle gaps"""
     print(f"[Web]           {host.name} -> server:5203  ({duration}s, bursty)")
     end_time = duration
     elapsed = 0
@@ -191,15 +199,19 @@ def run_web(host, duration=30):
 
 
 def run_file_transfer(host, duration=30):
+    """FTP / bulk transfer - uncapped TCP"""
     print(f"[File Transfer] {host.name} -> server:5204  ({duration}s)")
     out = host.cmd(f"iperf3 -c {_server_ip()} -p 5204 -t {duration} --json")
     _log("ftp", host, "tcp", "unlimited", out, flow_priority="low", qos_class="bulk")
 
 
 def run_background(host, duration=30):
+    """Background - low duty-cycle TCP with scaled idle times"""
     print(f"[Background]    {host.name} -> server:5205  ({duration}s, low duty-cycle)")
     elapsed = 0
     chunk_n = 0
+    # Scale idle time to duration (max 6s, min 1s)
+    idle_time = min(6, max(1, duration // 5))
     while elapsed < duration:
         on_time = min(2, duration - elapsed)
         out = host.cmd(f"iperf3 -c {_server_ip()} -p 5205 -b 1M -t {on_time} --json")
@@ -207,7 +219,7 @@ def run_background(host, duration=30):
              flow_priority="lowest", qos_class="background")
         elapsed += on_time
         chunk_n += 1
-        idle = min(6, duration - elapsed)
+        idle = min(idle_time, duration - elapsed)
         if idle > 0:
             sleep(idle)
             elapsed += idle
@@ -215,12 +227,14 @@ def run_background(host, duration=30):
 
 
 def run_cloud(host, duration=30):
+    """Cloud/Email - steady TCP, protected, high bandwidth"""
     print(f"[Cloud]         {host.name} -> server:5206  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -b 10M -t {duration} --json")
-    _log("cloud", host, "tcp", "10M", out, flow_priority="high", qos_class="AF31")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -b 50M -t {duration} --json")
+    _log("cloud", host, "tcp", "50M", out, flow_priority="high", qos_class="AF31")
 
 
 def run_dns(host, count=20):
+    """DNS simulation - many tiny queries"""
     print(f"[DNS]           {host.name}  ({count} queries)")
     start = datetime.now()
     host.cmd(
@@ -237,6 +251,7 @@ def run_dns(host, count=20):
 
 
 def run_ping(host, count=10):
+    """ICMP latency baseline"""
     print(f"[Ping]          {host.name} -> {SERVER_HOST}")
     result = host.cmd(f"ping -c {count} {_server_ip()}")
     loss_match = re.search(r'(\d+)% packet loss', result)
@@ -250,11 +265,28 @@ def run_ping(host, count=10):
     print(f"  [LOG] ping on {host.name}: {lost_pct}% loss")
 
 
+def stop_all_traffic():
+    """Kill all iperf3 processes on every host."""
+    print("Stopping all iperf3 processes...")
+    for host in net.hosts:
+        host.cmd("pkill -9 iperf3 2>/dev/null")
+    print("Done.")
+
+
 # ---------------------------------------------------------------------------
 # Composite runners
 # ---------------------------------------------------------------------------
 
 def run_all_traffic(duration=30, with_qos=True):
+    """Run all traffic types concurrently from dedicated hosts."""
+    # Restart iperf3 servers before each run
+    print("🔄 Restarting iperf3 servers...")
+    server = net.get(SERVER_HOST)
+    server.cmd("pkill -9 iperf3 2>/dev/null; sleep 0.5")
+    for port in range(5201, 5207):
+        server.cmd(f"iperf3 -s -p {port} -D")  # -D runs as daemon
+    sleep(0.5)
+    
     print("\n" + "="*50)
     print(f"  ALL Traffic  |  {duration}s  |  server={SERVER_HOST} ({_server_ip()})")
     print("="*50 + "\n")
@@ -278,6 +310,15 @@ def run_all_traffic(duration=30, with_qos=True):
 
 
 def run_voip_vs_web(duration=60, with_qos=True):
+    """Priority test - VoIP (h1) vs Web (h3) competing for bandwidth."""
+    # Restart iperf3 servers
+    print("🔄 Restarting iperf3 servers...")
+    server = net.get(SERVER_HOST)
+    server.cmd("pkill -9 iperf3 2>/dev/null; sleep 0.5")
+    for port in range(5201, 5207):
+        server.cmd(f"iperf3 -s -p {port} -D")
+    sleep(0.5)
+    
     print("\n" + "="*50)
     print("  TEST: VoIP (high priority) vs Web (low priority)")
     print("="*50 + "\n")
@@ -296,6 +337,15 @@ def run_voip_vs_web(duration=60, with_qos=True):
 
 
 def run_stress_test(duration=60, streams=5, with_qos=True):
+    """High load - 5 parallel TCP streams from each of h1-h4 concurrently"""
+    # Restart iperf3 servers
+    print("🔄 Restarting iperf3 servers...")
+    server = net.get(SERVER_HOST)
+    server.cmd("pkill -9 iperf3 2>/dev/null; sleep 0.5")
+    for port in range(5201, 5207):
+        server.cmd(f"iperf3 -s -p {port} -D")
+    sleep(0.5)
+    
     print("\n" + "="*50)
     print(f"  STRESS TEST  |  {streams} streams x 4 hosts  |  {duration}s")
     print("="*50 + "\n")
@@ -325,11 +375,55 @@ def run_stress_test(duration=60, streams=5, with_qos=True):
     print("="*50)
 
 
-def stop_all_traffic():
-    print("Stopping all iperf3 processes...")
-    for host in net.hosts:
-        host.cmd("pkill iperf3")
-    print("Done.")
+def run_high_bandwidth_test(duration=30):
+    """High-bandwidth test showing QoS protection clearly"""
+    # Restart iperf3 servers
+    print("🔄 Restarting iperf3 servers...")
+    server = net.get(SERVER_HOST)
+    server.cmd("pkill -9 iperf3 2>/dev/null; sleep 0.5")
+    for port in range(5201, 5207):
+        server.cmd(f"iperf3 -s -p {port} -D")
+    sleep(0.5)
+    
+    print("\n" + "="*60)
+    print("  HIGH BANDWIDTH QOS TEST")
+    print("  VoIP: 10M (protected), Video: 20M, Cloud: 50M")
+    print("  HTTP: 200M, FTP: 300M (best-effort, should be limited)")
+    print("="*60 + "\n")
+    
+    setup_qos()
+    
+    server_ip = _server_ip()
+    h1, h2, h3, h4, h5, h6 = (_h(f'h{i}') for i in range(1, 7))
+    
+    # Protected flows (should get full bandwidth)
+    print("[VoIP] h1 @ 10Mbps (UDP, HIGHEST PRIORITY)")
+    h1.cmd(f"iperf3 -c {server_ip} -p 5201 -u -b 10M -l 1400 -t {duration} &")
+    
+    print("[Video] h2 @ 20Mbps (UDP, HIGH PRIORITY)")
+    h2.cmd(f"iperf3 -c {server_ip} -p 5202 -u -b 20M -l 1400 -t {duration} &")
+    
+    print("[Cloud] h6 @ 50Mbps (TCP, HIGH PRIORITY)")
+    h6.cmd(f"iperf3 -c {server_ip} -p 5206 -b 50M -t {duration} &")
+    
+    # Greedy best-effort flows (should be throttled)
+    print("[HTTP] h3 @ 200Mbps (TCP, LOW PRIORITY - should be limited)")
+    h3.cmd(f"iperf3 -c {server_ip} -p 5203 -b 200M -t {duration} &")
+    
+    print("[FTP] h4 @ 300Mbps (TCP, LOW PRIORITY - should be limited)")
+    h4.cmd(f"iperf3 -c {server_ip} -p 5204 -b 300M -t {duration} &")
+    
+    print("[Background] h5 @ 10Mbps (TCP, LOWEST PRIORITY)")
+    h5.cmd(f"iperf3 -c {server_ip} -p 5205 -b 10M -t {duration} &")
+    
+    print(f"\n✅ All flows running for {duration}s...")
+    sleep(duration)
+    
+    print("\n🛑 Stopping all traffic...")
+    for host in [h1, h2, h3, h4, h5, h6]:
+        host.cmd("pkill -9 iperf3 2>/dev/null")
+    
+    print("✅ Done. Call save_logs() to export results.")
 
 
 # ---------------------------------------------------------------------------
@@ -339,20 +433,21 @@ def stop_all_traffic():
 print("\n✅ Traffic generator loaded!")
 print(f"  Server: {SERVER_HOST} ({_server_ip()})")
 print("\n📊 QoS Commands:")
-print("  setup_qos()                 - Protect VoIP/Cloud bandwidth")
+print("  setup_qos()                 - Protect VoIP/Cloud bandwidth via tc/HTB")
 print("  clear_qos()                 - Remove tc rules")
 print("\n🚀 Composite commands:")
 print("  run_all_traffic(30)         - All 6 traffic types")
 print("  run_voip_vs_web(60)         - VoIP vs Web priority test")
 print("  run_stress_test(60)         - High load stress test")
+print("  run_high_bandwidth_test(30) - High bandwidth QoS test")
 print("  stop_all_traffic()          - Kill all iperf3 processes")
 print("  save_logs()                 - Export results to CSV")
 print("\nIndividual commands:")
-print("  run_voip(h1)                - VoIP on h1")
-print("  run_video(h2)               - Video on h2")
-print("  run_web(h3)                 - Web on h3")
-print("  run_file_transfer(h4)       - File transfer on h4")
-print("  run_background(h5)          - Background on h5")
-print("  run_cloud(h6)               - Cloud on h6")
+print("  run_voip(h1)                - VoIP on h1 (10M, protected)")
+print("  run_video(h2)               - Video on h2 (5M)")
+print("  run_web(h3)                 - Web on h3 (bursty)")
+print("  run_file_transfer(h4)       - File transfer on h4 (uncapped)")
+print("  run_background(h5)          - Background on h5 (low duty-cycle)")
+print("  run_cloud(h6)               - Cloud on h6 (50M, protected)")
 print("  run_dns(h5)                 - DNS simulation on h5")
 print("  run_ping(h1)                - Ping latency test")
