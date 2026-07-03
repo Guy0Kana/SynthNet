@@ -233,7 +233,7 @@ def run_background(host, duration=30):
 def run_cloud(host, duration=30):
     """Cloud/Email - steady TCP, protected, high bandwidth"""
     print(f"[Cloud]         {host.name} -> server:5206  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -b 50M -t {duration} --json")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -b 50M -u {duration} --json")
     _log("cloud", host, "tcp", "50M", out, flow_priority="high", qos_class="AF31")
 
 
