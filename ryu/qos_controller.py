@@ -8,68 +8,82 @@ from ryu.lib.packet import packet, ethernet, ipv4, tcp, udp
 from ryu.lib import hub
 
 import requests
+import json
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 ML_API_URL = "http://localhost:8000/classify"
-FEATURE_TIMEOUT = 60          # Max seconds to collect flow stats
-MIN_PACKETS = 5               # Minimum packets needed for stats
+FLOW_SAMPLES = 30
+FEATURE_TIMEOUT = 60
 
-# IP of the traffic-gen "server" host. Reverse traffic from it is
-# forwarded normally without going through the classifier.
-# Must match whatever IP your Mininet topology assigns to the server host.
-SERVER_IP = "10.0.0.10"
+TCP_FIN = 0x01
+TCP_SYN = 0x02
+TCP_RST = 0x04
+TCP_PSH = 0x08
+TCP_ACK = 0x10
+TCP_URG = 0x20
+TCP_ECE = 0x40
+TCP_CWR = 0x80
 
 # QoS Priority Mapping (higher number = higher priority)
-# NOTE: this is the map that actually decides installed flow priority.
-# Keep it in sync with the FastAPI service's PRIORITY_MAP for consistency,
-# even though the API's own priority field isn't used here.
 PRIORITY_MAP = {
     'voip': 10,
-    'streaming': 7,
-    'mail': 6,
-    'browsing': 5,
-    'chat': 4,
-    'ft': 3,
-    'p2p': 2,
+    'cloud_email': 9,
+    'dns': 8,
+    'http': 5,
+    'web': 5,
+    'realtime': 5,
+    'video': 2,
+    'ftp': 2,
+    'background': 1,
+    'p2p': 1,
     'default': 4,
 }
 
-# ============================================================
-# SECTION 1 — TC Policy Configuration
-# ============================================================
-
-TC_POLICY = {
-    'voip':       {'rate': 300, 'prio': 0, 'ceil': 1000},
-    'video':      {'rate': 200, 'prio': 1, 'ceil': 1000},
-    'cloud':      {'rate': 400, 'prio': 0, 'ceil': 1000},
-    'http':       {'rate': 100, 'prio': 2, 'ceil': 500},
-    'ftp':        {'rate': 100, 'prio': 3, 'ceil': 300},
-    'background': {'rate':  50, 'prio': 4, 'ceil': 100},
-    'default':    {'rate':  50, 'prio': 4, 'ceil': 100},
+# Meter Mapping (1 = highest priority queue, 4 = lowest)
+METER_MAP = {
+    'voip': 1,
+    'cloud_email': 1,
+    'dns': 2,
+    'http': 2,
+    'web': 2,
+    'realtime': 2,
+    'video': 3,
+    'ftp': 3,
+    'background': 4,
+    'p2p': 4,
+    'default': 4,
 }
 
-# Map src_ip → (host_name, tc_server_url, interface)
-HOST_TC_MAP = {
-    '10.0.0.1':  ('h1', 'http://10.0.0.1:9001/set_tc', 'h1-eth0'),
-    '10.0.0.2':  ('h2', 'http://10.0.0.2:9002/set_tc', 'h2-eth0'),
-    '10.0.0.3':  ('h3', 'http://10.0.0.3:9003/set_tc', 'h3-eth0'),
-    '10.0.0.4':  ('h4', 'http://10.0.0.4:9004/set_tc', 'h4-eth0'),
-    '10.0.0.5':  ('h5', 'http://10.0.0.5:9005/set_tc', 'h5-eth0'),
-    '10.0.0.6':  ('h6', 'http://10.0.0.6:9006/set_tc', 'h6-eth0'),
-}
 
-# ============================================================
-# FLOW BUFFER - Collects 10 features for XGBoost
-# ============================================================
+def extract_tcp_flags(tcp_pkt):
+    flags = []
+    if tcp_pkt:
+        bits = tcp_pkt.bits
+        if bits & TCP_CWR:
+            flags.append('CWR')
+        if bits & TCP_ECE:
+            flags.append('ECE')
+        if bits & TCP_URG:
+            flags.append('URG')
+        if bits & TCP_ACK:
+            flags.append('ACK')
+        if bits & TCP_PSH:
+            flags.append('PSH')
+        if bits & TCP_RST:
+            flags.append('RST')
+        if bits & TCP_SYN:
+            flags.append('SYN')
+        if bits & TCP_FIN:
+            flags.append('FIN')
+    return flags
+
 
 class FlowBuffer:
     def __init__(self, flow_key, timeout=FEATURE_TIMEOUT):
         self.flow_key = flow_key
+        self.packets = []
         self.start_time = time.time()
         self.timeout = timeout
         self.completed = False
@@ -77,39 +91,25 @@ class FlowBuffer:
         self.origin_src = None
         self.src_ip = None
 
-        # Packet tracking
-        self.packet_count = 0
-        self.total_bytes = 0
-
-        # IAT tracking
-        self.fiat_values = []      # Forward IATs (same direction)
-        self.biat_values = []      # Backward IATs (opposite direction)
-        self.flowiat_values = []   # All IATs
-
-        # State for IAT calculation
-        self.last_timestamp = None
-        self.last_direction = None
-
-        # Direction tracking
         self.bytes_fwd = 0
         self.bytes_rev = 0
         self.packets_fwd = 0
         self.packets_rev = 0
 
-    def add_packet(self, pkt_data, timestamp, src_ip):
-        """Add a packet and update IAT stats"""
-        if not self.origin_src:
+        self.tcp_flags_fwd = Counter()
+        self.tcp_flags_rev = Counter()
+
+        self.ppi_roundtrips = 0
+        self.last_dir = None
+
+    def add_packet(self, pkt_data, timestamp, src_ip, tcp_flags=None):
+        if not self.packets:
             self.origin_src = src_ip
             self.src_ip = src_ip
 
-        # Determine direction
         direction = 1 if src_ip == self.origin_src else -1
+
         pkt_size = len(pkt_data)
-
-        # Update byte/packet counts
-        self.packet_count += 1
-        self.total_bytes += pkt_size
-
         if direction == 1:
             self.bytes_fwd += pkt_size
             self.packets_fwd += 1
@@ -117,61 +117,29 @@ class FlowBuffer:
             self.bytes_rev += pkt_size
             self.packets_rev += 1
 
-        # Calculate IATs
-        if self.last_timestamp is not None and self.last_direction is not None:
-            iat = timestamp - self.last_timestamp
-
-            # Forward IAT: same direction as previous packet
-            if self.last_direction == direction:
-                self.fiat_values.append(iat)
-            # Backward IAT: opposite direction
+        if tcp_flags:
+            if direction == 1:
+                for flag in tcp_flags:
+                    self.tcp_flags_fwd[flag] += 1
             else:
-                self.biat_values.append(iat)
+                for flag in tcp_flags:
+                    self.tcp_flags_rev[flag] += 1
 
-            # Flow IAT: all packets regardless of direction
-            self.flowiat_values.append(iat)
+        if self.last_dir is not None and self.last_dir != direction:
+            self.ppi_roundtrips += 1
 
-        self.last_timestamp = timestamp
-        self.last_direction = direction
+        self.last_dir = direction
 
-        # Check if we have enough data
-        if self.packet_count >= MIN_PACKETS:
+        self.packets.append({
+            'size': len(pkt_data),
+            'timestamp': timestamp,
+            'dir': direction
+        })
+
+        if len(self.packets) >= FLOW_SAMPLES:
             self.completed = True
             return True
         return False
-
-    def extract_features(self):
-        """Extract the 10 features for XGBoost"""
-        duration = time.time() - self.start_time
-        if duration < 0.001:
-            duration = 0.001
-
-        # Calculate IAT stats
-        total_fiat = sum(self.fiat_values) if self.fiat_values else 0
-        total_biat = sum(self.biat_values) if self.biat_values else 0
-        min_fiat = min(self.fiat_values) if self.fiat_values else 0
-        min_biat = min(self.biat_values) if self.biat_values else 0
-        max_fiat = max(self.fiat_values) if self.fiat_values else 0
-        max_biat = max(self.biat_values) if self.biat_values else 0
-        mean_biat = total_biat / len(self.biat_values) if self.biat_values else 0
-
-        flow_iats = self.flowiat_values
-        max_flowiat = max(flow_iats) if flow_iats else 0
-        mean_flowiat = sum(flow_iats) / len(flow_iats) if flow_iats else 0
-
-        # Return exactly 10 features (matches XGBoost training)
-        return [
-            duration,       # 1
-            total_fiat,     # 2
-            total_biat,     # 3
-            min_fiat,       # 4
-            min_biat,       # 5
-            max_fiat,       # 6
-            max_biat,       # 7
-            mean_biat,      # 8
-            max_flowiat,    # 9
-            mean_flowiat    # 10
-        ]
 
     def is_expired(self):
         return (time.time() - self.start_time) > self.timeout
@@ -182,10 +150,70 @@ class FlowBuffer:
     def is_dispatched(self):
         return self.completed_dispatched
 
+    def get_flowstats(self):
+        duration = time.time() - self.start_time
+        if duration < 0.001:
+            duration = 0.001
 
-# ============================================================
-# MAIN RYU CONTROLLER
-# ============================================================
+        if len(self.packets) >= 2:
+            ppi_duration = self.packets[-1]['timestamp'] - self.packets[0]['timestamp']
+        else:
+            ppi_duration = 0
+
+        flowstats = [
+            self.bytes_fwd,
+            self.bytes_rev,
+            self.packets_fwd,
+            self.packets_rev,
+            duration,
+            len(self.packets),
+            self.ppi_roundtrips,
+            ppi_duration,
+            self.tcp_flags_fwd.get('CWR', 0),
+            self.tcp_flags_rev.get('CWR', 0),
+            self.tcp_flags_fwd.get('ECE', 0),
+            self.tcp_flags_rev.get('ECE', 0),
+            self.tcp_flags_rev.get('PSH', 0),
+            self.tcp_flags_fwd.get('RST', 0),
+            self.tcp_flags_rev.get('RST', 0),
+            self.tcp_flags_fwd.get('FIN', 0),
+            self.tcp_flags_rev.get('FIN', 0),
+        ]
+
+        return flowstats
+
+    def extract_ppi_features(self):
+        if len(self.packets) < 5:
+            return None
+
+        sizes = [p['size'] for p in self.packets]
+
+        timestamps = [p['timestamp'] for p in self.packets]
+        ipts = [0]
+        for i in range(1, len(timestamps)):
+            ipt_us = (timestamps[i] - timestamps[i-1]) * 1_000_000
+            ipts.append(int(ipt_us))
+
+        dirs = [p['dir'] for p in self.packets]
+
+        while len(sizes) < FLOW_SAMPLES:
+            sizes.append(0)
+            ipts.append(0)
+            dirs.append(0)
+
+        sizes = sizes[:FLOW_SAMPLES]
+        ipts = ipts[:FLOW_SAMPLES]
+        dirs = dirs[:FLOW_SAMPLES]
+
+        return {
+            'sizes': sizes,
+            'ipts': ipts,
+            'dirs': dirs
+        }
+
+    def packet_count(self):
+        return len(self.packets)
+
 
 class QoSRyuController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -196,6 +224,7 @@ class QoSRyuController(app_manager.RyuApp):
         self.flow_buffers = {}
         self.flow_classifications = {}
         self.datapaths = {}
+
         self.mac_to_port = {}
 
         self.stats = {
@@ -204,23 +233,15 @@ class QoSRyuController(app_manager.RyuApp):
             'api_calls': 0,
             'api_failures': 0,
             'packets_captured': 0,
-            'tc_policies_applied': 0,
-            'tc_failures': 0,
         }
 
         self.cleanup_thread = hub.spawn(self._cleanup_loop)
 
+        self.logger.info("QoS Ryu Controller initialized")
+        self.logger.info(f"ML API endpoint: {ML_API_URL}")
+        self.logger.info(f"Collecting first {FLOW_SAMPLES} packets per flow")
+        self.logger.info(f"Feature timeout: {FEATURE_TIMEOUT} seconds")
         self.logger.info("=" * 60)
-        self.logger.info("QoS Ryu Controller (XGBoost Version) + TC Integration")
-        self.logger.info(f"ML API: {ML_API_URL}")
-        self.logger.info(f"Min packets: {MIN_PACKETS}")
-        self.logger.info(f"Feature timeout: {FEATURE_TIMEOUT}s")
-        self.logger.info(f"TC enabled hosts: {len(HOST_TC_MAP)}")
-        self.logger.info("=" * 60)
-
-    # ============================================================
-    # SWITCH CONNECTION
-    # ============================================================
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -246,7 +267,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod)
 
-        # ARP flood
+        # ARP flood flow - use FLOOD (OFPP_NORMAL fails in OpenFlow 1.3)
         match_arp = parser.OFPMatch(eth_type=0x0806)
         actions_arp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst_arp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_arp)]
@@ -260,7 +281,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod_arp)
 
-        # ICMP flood
+        # ICMP flood flow - use FLOOD
         match_icmp = parser.OFPMatch(eth_type=0x0800, ip_proto=1)
         actions_icmp = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst_icmp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions_icmp)]
@@ -274,11 +295,7 @@ class QoSRyuController(app_manager.RyuApp):
         )
         datapath.send_msg(mod_icmp)
 
-        self.logger.info("Default flows installed")
-
-    # ============================================================
-    # PACKET IN HANDLER
-    # ============================================================
+        self.logger.info("Default, ARP, ICMP flows installed")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -298,51 +315,43 @@ class QoSRyuController(app_manager.RyuApp):
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][eth.src] = in_port
 
-        flow_key, src_ip = self._extract_flow_key(pkt, in_port)
+        flow_key, src_ip, tcp_flags = self._extract_flow_key(pkt, in_port)
 
         if flow_key is None:
             self._forward_normal(datapath, in_port, msg.data)
             return
 
-        # Ignore reverse traffic from server
-        if flow_key[0] == SERVER_IP:
+        # IGNORE REVERSE TRAFFIC FROM SERVER
+        if flow_key[0] == "10.0.0.10":
             self._forward_normal(datapath, in_port, msg.data)
             return
 
         self.stats['packets_captured'] += 1
 
-        # Already classified?
         if flow_key in self.flow_classifications:
             traffic_class = self.flow_classifications[flow_key]
             self._install_qos_flow(datapath, flow_key, in_port, traffic_class, msg.data, eth.dst)
             return
 
-        # New flow - start buffering
         if flow_key not in self.flow_buffers:
             self.flow_buffers[flow_key] = FlowBuffer(flow_key)
             self.logger.info(f"New flow from {src_ip} (buffers: {len(self.flow_buffers)})")
 
         buffer = self.flow_buffers[flow_key]
         timestamp = time.time()
-        completed = buffer.add_packet(msg.data, timestamp, src_ip)
+        completed = buffer.add_packet(msg.data, timestamp, src_ip, tcp_flags)
 
-        # Forward packet normally while collecting
         self._forward_normal(datapath, in_port, msg.data)
 
-        # Classify when complete
         if completed and not buffer.is_dispatched():
             buffer.mark_dispatched()
-            self.logger.info(f"Flow collected {buffer.packet_count} packets, classifying...")
+            self.logger.info(f"Flow collected {FLOW_SAMPLES} packets, classifying...")
             hub.spawn(self._classify_flow, datapath, flow_key, in_port, buffer, eth.dst)
-
-    # ============================================================
-    # FLOW KEY EXTRACTION
-    # ============================================================
 
     def _extract_flow_key(self, pkt, in_port):
         ip = pkt.get_protocol(ipv4.ipv4)
         if not ip:
-            return None, None
+            return None, None, None
 
         src_ip = ip.src
         dst_ip = ip.dst
@@ -350,6 +359,7 @@ class QoSRyuController(app_manager.RyuApp):
 
         src_port = None
         dst_port = None
+        tcp_flags = None
 
         tcp_pkt = pkt.get_protocol(tcp.tcp)
         udp_pkt = pkt.get_protocol(udp.udp)
@@ -357,118 +367,60 @@ class QoSRyuController(app_manager.RyuApp):
         if tcp_pkt:
             src_port = tcp_pkt.src_port
             dst_port = tcp_pkt.dst_port
+            tcp_flags = extract_tcp_flags(tcp_pkt)
         elif udp_pkt:
             src_port = udp_pkt.src_port
             dst_port = udp_pkt.dst_port
 
         flow_key = (src_ip, dst_ip, src_port, dst_port, protocol, in_port)
-        return flow_key, src_ip
-
-    # ============================================================
-    # SECTION 2 — TC Policy Application Method
-    # ============================================================
-
-    def _apply_tc_policy(self, src_ip, traffic_class):
-        """
-        Dynamically update tc HTB bandwidth on the source host
-        based on ML classification result.
-        Called from _classify_flow() after FastAPI returns a label.
-        """
-        if src_ip not in HOST_TC_MAP:
-            self.logger.debug(f"No tc mapping for {src_ip} — skipping")
-            return
-
-        host_name, url, intf = HOST_TC_MAP[src_ip]
-        policy = TC_POLICY.get(traffic_class, TC_POLICY['default'])
-
-        try:
-            response = requests.post(
-                url,
-                json={
-                    'rate': policy['rate'],
-                    'prio': policy['prio'],
-                    'ceil': policy['ceil'],
-                    'intf': intf,
-                },
-                timeout=1,
-            )
-            if response.status_code == 200:
-                self.logger.info(
-                    f"tc updated: {host_name} ({src_ip}) → {traffic_class} "
-                    f"[rate={policy['rate']}mbit, "
-                    f"ceil={policy['ceil']}mbit, "
-                    f"prio={policy['prio']}]"
-                )
-                self.stats['tc_policies_applied'] += 1
-            else:
-                self.logger.warning(
-                    f"tc server error for {host_name}: {response.status_code}"
-                )
-                self.stats['tc_failures'] += 1
-        except requests.exceptions.ConnectionError:
-            self.logger.warning(
-                f"tc server unreachable for {host_name} at {url} "
-                f"— is tiny_tc_server.py running on that host?"
-            )
-            self.stats['tc_failures'] += 1
-        except requests.exceptions.Timeout:
-            self.logger.warning(f"tc server timeout for {host_name}")
-            self.stats['tc_failures'] += 1
-        except Exception as e:
-            self.logger.error(f"tc policy error for {host_name}: {e}")
-            self.stats['tc_failures'] += 1
-
-    # ============================================================
-    # CLASSIFICATION (Calls FastAPI)
-    # ============================================================
+        return flow_key, src_ip, tcp_flags
 
     def _classify_flow(self, datapath, flow_key, in_port, buffer, dst_mac=None):
-        # Extract 10 features
-        features = buffer.extract_features()
+        ppi_features = buffer.extract_ppi_features()
+        flowstats = buffer.get_flowstats()
+
+        if not ppi_features:
+            self.logger.warning(f"Insufficient features, using default")
+            self._install_default_flow(datapath, flow_key, in_port, dst_mac)
+            if flow_key in self.flow_buffers:
+                del self.flow_buffers[flow_key]
+            return
+
+        api_payload = {
+            'sizes': ppi_features['sizes'],
+            'ipts': ppi_features['ipts'],
+            'dirs': ppi_features['dirs'],
+            'flowstats': flowstats
+        }
 
         src_ip = flow_key[0] if flow_key else "unknown"
-        self.logger.info(f"Classifying flow from {src_ip} ({buffer.packet_count} packets)")
+        self.logger.info(f"Classifying flow from {src_ip} ({buffer.packet_count()} packets collected)")
 
         try:
             self.stats['api_calls'] += 1
-            response = requests.post(
-                ML_API_URL,
-                json={'features': features},
-                timeout=5
-            )
+            response = requests.post(ML_API_URL, json=api_payload, timeout=5)
 
             if response.status_code == 200:
                 result = response.json()
-                traffic_class = result.get('traffic_type', 'default').lower()
+                traffic_class = result.get('category', 'default')
                 confidence = result.get('confidence', 0)
 
-                self.logger.info(f"Flow classified: {traffic_class} (conf: {confidence:.2f})")
+                self.logger.info(f"Flow classified as: {traffic_class} (confidence: {confidence:.2f})")
                 self.stats['flows_classified'] += 1
 
-                # Store classification
                 self.flow_classifications[flow_key] = traffic_class
-
-                # ── SECTION 3: Apply tc bandwidth policy on source host ──
-                #self._apply_tc_policy(src_ip, traffic_class)
-
-                # Install OpenFlow QoS rules (recommended to keep)
                 self._install_qos_flow(datapath, flow_key, in_port, traffic_class, None, dst_mac)
             else:
                 self.logger.warning(f"API error: {response.status_code}")
                 self._install_default_flow(datapath, flow_key, in_port, dst_mac)
 
         except requests.exceptions.RequestException as e:
-            self.logger.warning(f"ML API unreachable: {e}")
+            self.logger.warning(f"ML backend unreachable: {e}")
             self.stats['api_failures'] += 1
             self._install_default_flow(datapath, flow_key, in_port, dst_mac)
 
-        # Clean up buffer
         if flow_key in self.flow_buffers:
             del self.flow_buffers[flow_key]
-
-    # ============================================================
-    # QoS FLOW INSTALLATION
-    # ============================================================
 
     def _install_qos_flow(self, datapath, flow_key, in_port, traffic_class, data, dst_mac=None):
         ofproto = datapath.ofproto
@@ -477,7 +429,7 @@ class QoSRyuController(app_manager.RyuApp):
         src_ip, dst_ip, src_port, dst_port, protocol, in_port_val = flow_key
         priority = PRIORITY_MAP.get(traffic_class, 4)
 
-        # Determine output port
+        # Determine output port from MAC learning table
         dpid = datapath.id
         out_port = None
 
@@ -485,55 +437,78 @@ class QoSRyuController(app_manager.RyuApp):
             if dst_mac in self.mac_to_port[dpid]:
                 out_port = self.mac_to_port[dpid][dst_mac]
 
-        actions = [parser.OFPActionOutput(out_port)] if out_port is not None else \
-                  [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        # Use FLOOD if port not learned
+        if out_port is not None:
+            actions = [parser.OFPActionOutput(out_port)]
+        else:
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
 
         instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
 
-        # Build matches (both directions)
+        # Build matches with full 5-tuple for granular QoS
         if src_port and dst_port and src_port > 0 and dst_port > 0:
             if protocol == 6:  # TCP
                 match_fwd = parser.OFPMatch(
-                    eth_type=0x0800, ip_proto=6,
-                    ipv4_src=src_ip, ipv4_dst=dst_ip,
-                    tcp_src=src_port, tcp_dst=dst_port,
+                    eth_type=0x0800,
+                    ip_proto=6,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                    tcp_src=src_port,
+                    tcp_dst=dst_port,
                 )
                 match_rev = parser.OFPMatch(
-                    eth_type=0x0800, ip_proto=6,
-                    ipv4_src=dst_ip, ipv4_dst=src_ip,
-                    tcp_src=dst_port, tcp_dst=src_port,
+                    eth_type=0x0800,
+                    ip_proto=6,
+                    ipv4_src=dst_ip,
+                    ipv4_dst=src_ip,
+                    tcp_src=dst_port,
+                    tcp_dst=src_port,
                 )
             elif protocol == 17:  # UDP
                 match_fwd = parser.OFPMatch(
-                    eth_type=0x0800, ip_proto=17,
-                    ipv4_src=src_ip, ipv4_dst=dst_ip,
-                    udp_src=src_port, udp_dst=dst_port,
+                    eth_type=0x0800,
+                    ip_proto=17,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
+                    udp_src=src_port,
+                    udp_dst=dst_port,
                 )
                 match_rev = parser.OFPMatch(
-                    eth_type=0x0800, ip_proto=17,
-                    ipv4_src=dst_ip, ipv4_dst=src_ip,
-                    udp_src=dst_port, udp_dst=src_port,
+                    eth_type=0x0800,
+                    ip_proto=17,
+                    ipv4_src=dst_ip,
+                    ipv4_dst=src_ip,
+                    udp_src=dst_port,
+                    udp_dst=src_port,
                 )
             else:
                 match_fwd = parser.OFPMatch(
-                    eth_type=0x0800, ip_proto=protocol,
-                    ipv4_src=src_ip, ipv4_dst=dst_ip,
+                    eth_type=0x0800,
+                    ip_proto=protocol,
+                    ipv4_src=src_ip,
+                    ipv4_dst=dst_ip,
                 )
                 match_rev = parser.OFPMatch(
-                    eth_type=0x0800, ip_proto=protocol,
-                    ipv4_src=dst_ip, ipv4_dst=src_ip,
+                    eth_type=0x0800,
+                    ip_proto=protocol,
+                    ipv4_src=dst_ip,
+                    ipv4_dst=src_ip,
                 )
         else:
             match_fwd = parser.OFPMatch(
-                eth_type=0x0800, ip_proto=protocol,
-                ipv4_src=src_ip, ipv4_dst=dst_ip,
+                eth_type=0x0800,
+                ip_proto=protocol,
+                ipv4_src=src_ip,
+                ipv4_dst=dst_ip,
             )
             match_rev = parser.OFPMatch(
-                eth_type=0x0800, ip_proto=protocol,
-                ipv4_src=dst_ip, ipv4_dst=src_ip,
+                eth_type=0x0800,
+                ip_proto=protocol,
+                ipv4_src=dst_ip,
+                ipv4_dst=src_ip,
             )
 
-        # Install both directions
+        # Install forward and reverse flows
         for match in [match_fwd, match_rev]:
             mod = parser.OFPFlowMod(
                 datapath=datapath,
@@ -547,9 +522,8 @@ class QoSRyuController(app_manager.RyuApp):
             datapath.send_msg(mod)
 
         self.stats['policies_applied'] += 1
-        self.logger.info(f"Installed QoS: {traffic_class} (priority={priority})")
+        self.logger.info(f"Installed QoS flow (both directions): {traffic_class} (priority={priority})")
 
-        # Send original packet if needed
         if data:
             out = parser.OFPPacketOut(
                 datapath=datapath,
@@ -563,10 +537,6 @@ class QoSRyuController(app_manager.RyuApp):
     def _install_default_flow(self, datapath, flow_key, in_port, dst_mac=None):
         self.flow_classifications[flow_key] = 'default'
         self._install_qos_flow(datapath, flow_key, in_port, 'default', None, dst_mac)
-
-    # ============================================================
-    # UTILITY METHODS
-    # ============================================================
 
     def _forward_normal(self, datapath, in_port, data):
         ofproto = datapath.ofproto
@@ -585,13 +555,15 @@ class QoSRyuController(app_manager.RyuApp):
     def _cleanup_loop(self):
         while True:
             hub.sleep(1)
+
             expired = []
             for flow_key, buffer in self.flow_buffers.items():
                 if buffer.is_expired():
-                    expired.append(flow_key)
+                    expired.append((flow_key, buffer))
 
-            for flow_key in expired:
-                self.logger.warning(f"Flow expired: {flow_key[0]}")
+            for flow_key, buffer in expired:
+                src_ip = buffer.src_ip if buffer.src_ip else "unknown"
+                self.logger.warning(f"Flow from {src_ip} expired with {buffer.packet_count()} packets")
                 del self.flow_buffers[flow_key]
 
     @set_ev_cls(ofp_event.EventOFPErrorMsg, MAIN_DISPATCHER)
@@ -605,8 +577,6 @@ class QoSRyuController(app_manager.RyuApp):
             'api_calls': self.stats['api_calls'],
             'api_failures': self.stats['api_failures'],
             'packets_captured': self.stats['packets_captured'],
-            'tc_policies_applied': self.stats['tc_policies_applied'],
-            'tc_failures': self.stats['tc_failures'],
             'active_buffers': len(self.flow_buffers),
             'classified_flows': len(self.flow_classifications),
         }
