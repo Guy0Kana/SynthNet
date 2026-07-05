@@ -19,15 +19,23 @@ ML_API_URL = "http://localhost:8000/classify"
 FEATURE_TIMEOUT = 60          # Max seconds to collect flow stats
 MIN_PACKETS = 5               # Minimum packets needed for stats
 
+# IP of the traffic-gen "server" host. Reverse traffic from it is
+# forwarded normally without going through the classifier.
+# Must match whatever IP your Mininet topology assigns to the server host.
+SERVER_IP = "10.0.0.10"
+
 # QoS Priority Mapping (higher number = higher priority)
+# NOTE: this is the map that actually decides installed flow priority.
+# Keep it in sync with the FastAPI service's PRIORITY_MAP for consistency,
+# even though the API's own priority field isn't used here.
 PRIORITY_MAP = {
     'voip': 10,
-    'browsing': 5,
-    'chat': 8,
-    'ft': 3,
-    'mail': 6,
-    'p2p': 2,
     'streaming': 7,
+    'mail': 6,
+    'browsing': 5,
+    'chat': 4,
+    'ft': 3,
+    'p2p': 2,
     'default': 4,
 }
 
@@ -44,20 +52,20 @@ class FlowBuffer:
         self.completed_dispatched = False
         self.origin_src = None
         self.src_ip = None
-        
+
         # Packet tracking
         self.packet_count = 0
         self.total_bytes = 0
-        
+
         # IAT tracking
         self.fiat_values = []      # Forward IATs (same direction)
         self.biat_values = []      # Backward IATs (opposite direction)
         self.flowiat_values = []   # All IATs
-        
+
         # State for IAT calculation
         self.last_timestamp = None
         self.last_direction = None
-        
+
         # Direction tracking
         self.bytes_fwd = 0
         self.bytes_rev = 0
@@ -69,39 +77,39 @@ class FlowBuffer:
         if not self.origin_src:
             self.origin_src = src_ip
             self.src_ip = src_ip
-        
+
         # Determine direction
         direction = 1 if src_ip == self.origin_src else -1
         pkt_size = len(pkt_data)
-        
+
         # Update byte/packet counts
         self.packet_count += 1
         self.total_bytes += pkt_size
-        
+
         if direction == 1:
             self.bytes_fwd += pkt_size
             self.packets_fwd += 1
         else:
             self.bytes_rev += pkt_size
             self.packets_rev += 1
-        
+
         # Calculate IATs
         if self.last_timestamp is not None and self.last_direction is not None:
             iat = timestamp - self.last_timestamp
-            
+
             # Forward IAT: same direction as previous packet
             if self.last_direction == direction:
                 self.fiat_values.append(iat)
             # Backward IAT: opposite direction
             else:
                 self.biat_values.append(iat)
-            
+
             # Flow IAT: all packets regardless of direction
             self.flowiat_values.append(iat)
-        
+
         self.last_timestamp = timestamp
         self.last_direction = direction
-        
+
         # Check if we have enough data
         if self.packet_count >= MIN_PACKETS:
             self.completed = True
@@ -113,7 +121,7 @@ class FlowBuffer:
         duration = time.time() - self.start_time
         if duration < 0.001:
             duration = 0.001
-        
+
         # Calculate IAT stats
         total_fiat = sum(self.fiat_values) if self.fiat_values else 0
         total_biat = sum(self.biat_values) if self.biat_values else 0
@@ -121,15 +129,12 @@ class FlowBuffer:
         min_biat = min(self.biat_values) if self.biat_values else 0
         max_fiat = max(self.fiat_values) if self.fiat_values else 0
         max_biat = max(self.biat_values) if self.biat_values else 0
-        mean_fiat = total_fiat / len(self.fiat_values) if self.fiat_values else 0
         mean_biat = total_biat / len(self.biat_values) if self.biat_values else 0
-        
+
         flow_iats = self.flowiat_values
-        min_flowiat = min(flow_iats) if flow_iats else 0
         max_flowiat = max(flow_iats) if flow_iats else 0
         mean_flowiat = sum(flow_iats) / len(flow_iats) if flow_iats else 0
-        std_flowiat = 0  # Optional: compute if needed
-        
+
         # Return exactly 10 features (matches XGBoost training)
         return [
             duration,       # 1
@@ -153,8 +158,13 @@ class FlowBuffer:
     def is_dispatched(self):
         return self.completed_dispatched
 
-    def packet_count(self):
-        return self.packet_count
+    # NOTE: previously this was a method named `packet_count`, which
+    # collided with the `self.packet_count` int attribute set in
+    # __init__ (the attribute shadows the method on the instance).
+    # Any call to buffer.packet_count() therefore raised
+    # `TypeError: 'int' object is not callable`, which killed
+    # classification before it ever started. Fixed by using the
+    # attribute directly everywhere instead of a same-named method.
 
 
 # ============================================================
@@ -276,7 +286,7 @@ class QoSRyuController(app_manager.RyuApp):
             return
 
         # Ignore reverse traffic from server
-        if flow_key[0] == "10.0.0.10":
+        if flow_key[0] == SERVER_IP:
             self._forward_normal(datapath, in_port, msg.data)
             return
 
@@ -303,7 +313,7 @@ class QoSRyuController(app_manager.RyuApp):
         # Classify when complete
         if completed and not buffer.is_dispatched():
             buffer.mark_dispatched()
-            self.logger.info(f"Flow collected {buffer.packet_count()} packets, classifying...")
+            self.logger.info(f"Flow collected {buffer.packet_count} packets, classifying...")
             hub.spawn(self._classify_flow, datapath, flow_key, in_port, buffer, eth.dst)
 
     # ============================================================
@@ -344,7 +354,7 @@ class QoSRyuController(app_manager.RyuApp):
         features = buffer.extract_features()
 
         src_ip = flow_key[0] if flow_key else "unknown"
-        self.logger.info(f"Classifying flow from {src_ip} ({buffer.packet_count()} packets)")
+        self.logger.info(f"Classifying flow from {src_ip} ({buffer.packet_count} packets)")
 
         try:
             self.stats['api_calls'] += 1
