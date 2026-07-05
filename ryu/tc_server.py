@@ -7,7 +7,7 @@ Receives tc commands from Ryu controller and applies them locally.
 Usage (started automatically by campus_topo.py):
     python3 tiny_tc_server.py <port> <interface>
     e.g. python3 tiny_tc_server.py 9001 h1-eth0
-"""
+
 
 import sys
 import subprocess
@@ -122,3 +122,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+"""
