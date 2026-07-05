@@ -13,6 +13,9 @@ import joblib
 import os
 import time
 import logging
+import warnings
+
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
