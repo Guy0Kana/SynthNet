@@ -52,7 +52,16 @@ def _append_row(profile, host, protocol, bw_requested, mbps=0, nbytes=0,
 
 
 def _log(profile, host, protocol, bw_requested, raw_json, flow_priority='', qos_class=''):
-    """Parse iperf3 JSON output and append one row to _results."""
+    """Parse iperf3 JSON output and append one row to _results.
+
+    FIX: previously this always pulled nbytes/retransmits/lost_packets from
+    end['sum_sent'], which only exists for TCP tests. For UDP tests (VoIP,
+    Video) that key never exists, so those fields silently stayed at their
+    defaults (0 / 'n/a') even though jitter/loss were read correctly.
+    It also read bandwidth for UDP from a 'sender' sub-key that doesn't
+    exist in iperf3's UDP JSON output (that key is 'udp', or the top-level
+    'sum' object) -- so UDP mbps was always logged as 0.
+    """
     try:
         json_match = re.search(r'\{.*\}', raw_json, re.DOTALL)
         if not json_match:
@@ -68,24 +77,43 @@ def _log(profile, host, protocol, bw_requested, raw_json, flow_priority='', qos_
         jitter_ms = 'n/a'
         lost_pct = 'n/a'
         lost_packets = 0
+        nbytes = 0
+        retransmits = 'n/a'
 
         end = data.get('end', {})
+
         if 'sum_sent' in end:
-            mbps = round(end['sum_sent'].get('bits_per_second', 0) / 1e6, 2)
+            # TCP test
+            sum_sent = end['sum_sent']
+            mbps = round(sum_sent.get('bits_per_second', 0) / 1e6, 2)
+            nbytes = sum_sent.get('bytes', 0)
+            retransmits = sum_sent.get('retransmits', 'n/a')
+        elif 'sum' in end:
+            # UDP test - combined summary (standard iperf3 UDP JSON shape)
+            s = end['sum']
+            mbps = round(s.get('bits_per_second', 0) / 1e6, 2)
+            jitter_ms = s.get('jitter_ms', 'n/a')
+            lost_pct = s.get('lost_percent', 'n/a')
+            lost_packets = s.get('lost_packets', 0)
+            nbytes = s.get('bytes', 0)
         elif 'streams' in end and len(end['streams']) > 0:
-            sender = end['streams'][0].get('sender', {})
-            mbps = round(sender.get('bits_per_second', 0) / 1e6, 2)
-            udp = end['streams'][0].get('udp', {})
-            jitter_ms = udp.get('jitter_ms', 'n/a')
-            lost_pct = udp.get('lost_percent', 'n/a')
+            # Fallback: pull from the first stream (works for both UDP
+            # streams, keyed 'udp', and TCP streams, keyed 'sender')
+            stream0 = end['streams'][0]
+            stream_data = stream0.get('udp') or stream0.get('sender', {})
+            mbps = round(stream_data.get('bits_per_second', 0) / 1e6, 2)
+            jitter_ms = stream_data.get('jitter_ms', 'n/a')
+            lost_pct = stream_data.get('lost_percent', 'n/a')
+            lost_packets = stream_data.get('lost_packets', 0)
+            nbytes = stream_data.get('bytes', 0)
 
         _append_row(
             profile, host, protocol, bw_requested,
             mbps=mbps,
-            nbytes=end.get('sum_sent', {}).get('bytes', 0),
-            retransmits=end.get('sum_sent', {}).get('retransmits', 'n/a'),
+            nbytes=nbytes,
+            retransmits=retransmits,
             jitter_ms=jitter_ms,
-            lost_packets=end.get('sum_sent', {}).get('lost_packets', 0),
+            lost_packets=lost_packets,
             lost_pct=lost_pct,
             flow_priority=flow_priority,
             qos_class=qos_class,
@@ -132,7 +160,7 @@ def setup_qos():
         host.cmd(f"tc qdisc del dev {intf} root 2>/dev/null")
         host.cmd(f"tc qdisc add dev {intf} root handle 1: htb default 30")
         host.cmd(f"tc class add dev {intf} parent 1: classid 1:1 htb rate {LINK_MBIT}mbit")
-        
+
         # VoIP: 30% guaranteed (highest priority)
         host.cmd(f"tc class add dev {intf} parent 1:1 classid 1:10 htb "
                   f"rate {max(10, int(LINK_MBIT*0.30))}mbit ceil {LINK_MBIT}mbit prio 0")
@@ -233,7 +261,11 @@ def run_background(host, duration=30):
 def run_cloud(host, duration=30):
     """Cloud/Email - steady TCP, protected, high bandwidth"""
     print(f"[Cloud]         {host.name} -> server:5206  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -b 50M -u {duration} --json")
+    # FIX: original had "-u {duration}" which is malformed -- "-u" takes no
+    # argument, so "{duration}" was passed as a stray positional arg and
+    # iperf3 would error out instead of running. It also contradicts the
+    # "steady TCP" intent of this function (dropped -u, added -t).
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -b 50M -t {duration} --json")
     _log("cloud", host, "tcp", "50M", out, flow_priority="high", qos_class="AF31")
 
 
@@ -290,7 +322,7 @@ def run_all_traffic(duration=30, with_qos=True):
     for port in range(5201, 5207):
         server.cmd(f"iperf3 -s -p {port} -D")
     sleep(0.5)
-    
+
     print("\n" + "="*50)
     print(f"  ALL Traffic  |  {duration}s  |  server={SERVER_HOST} ({_server_ip()})")
     print("="*50 + "\n")
@@ -321,7 +353,7 @@ def run_voip_vs_web(duration=60, with_qos=True):
     for port in range(5201, 5207):
         server.cmd(f"iperf3 -s -p {port} -D")
     sleep(0.5)
-    
+
     print("\n" + "="*50)
     print("  TEST: VoIP (high priority) vs Web (low priority)")
     print("="*50 + "\n")
@@ -351,7 +383,7 @@ def run_stress_test(duration=30, with_qos=True):
     for port in range(5201, 5207):
         server.cmd(f"iperf3 -s -p {port} -D")
     sleep(0.5)
-    
+
     print("\n" + "="*70)
     print("  STRESS TEST: Heavy Traffic from ALL Hosts (h1-h6)")
     print("="*70)
@@ -428,20 +460,20 @@ def run_comparison_test(duration=20):
     print("  Run 1: No QoS → Run 2: With QoS")
     print("  Compare VoIP, Video, Cloud bandwidth!")
     print("="*70)
-    
+
     # Run No-QoS test
     print("\n📊 TEST 1: NO QoS")
     run_no_qos_demo(duration)
     os.rename("logs/traffic_gen.csv", "logs/traffic_gen_no_qos.csv")
-    
+
     # Clear logs
     _results.clear()
-    
+
     # Run QoS test
     print("\n📊 TEST 2: WITH QoS")
     run_qos_demo(duration)
     os.rename("logs/traffic_gen.csv", "logs/traffic_gen_with_qos.csv")
-    
+
     print("\n" + "="*70)
     print("  COMPARISON COMPLETE!")
     print("  Results saved to:")
