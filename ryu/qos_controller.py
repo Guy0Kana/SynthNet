@@ -449,7 +449,7 @@ class QoSRyuController(app_manager.RyuApp):
                 self.flow_classifications[flow_key] = traffic_class
 
                 # ── SECTION 3: Apply tc bandwidth policy on source host ──
-                self._apply_tc_policy(src_ip, traffic_class)
+                #self._apply_tc_policy(src_ip, traffic_class)
 
                 # Install OpenFlow QoS rules (recommended to keep)
                 self._install_qos_flow(datapath, flow_key, in_port, traffic_class, None, dst_mac)
