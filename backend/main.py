@@ -2,19 +2,17 @@
 
 """
 FastAPI Backend for ML-Based Traffic Classification
-Uses mm_cesnet_v1 with CESNET-TLS22_WEEK40 weights
+Uses XGBoost with 10 statistical features
 """
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
-import torch
-import torch.nn.functional as F
+import joblib
+import os
 import time
 import logging
-
-from cesnet_models.models import mm_cesnet_v1, MM_CESNET_V1_Weights
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,165 +21,173 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ============================================================================
 
-NUM_CESNET_CLASSES = 191
+# Paths to model files
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'model', 'traffic_classifier.pkl')
+SELECTOR_PATH = os.path.join(BASE_DIR, 'model', 'feature_selector.pkl')
 
-CESNET_TO_CAMPUS = {
-    'voip': ['voip', 'sip', 'rtp', 'voip_audio', 'voip_video', 'skype_audio',
-             'zoom_audio', 'teams_audio', 'whatsapp_call', 'facetime_audio'],
-    
-    'cloud_email': ['cloud', 'email', 'imap', 'pop3', 'smtp', 'gmail', 'outlook',
-                    'icloud', 'dropbox', 'google_drive', 'onedrive', 'sharepoint',
-                    'office365', 'google_cloud', 'aws', 'azure', 'salesforce'],
-    
-    'dns': ['dns', 'mdns', 'dns_over_tls', 'dns_over_https'],
-    
-    'http': ['http', 'https', 'web', 'browsing', 'rest_api', 'http_web',
-             'wordpress', 'github', 'stackoverflow'],
-    
-    'video': ['video', 'youtube', 'netflix', 'hulu', 'disney_plus', 'amazon_prime',
-              'vimeo', 'twitch', 'tiktok', 'instagram_video', 'facebook_video'],
-    
-    'ftp': ['ftp', 'sftp', 'scp', 'rsync', 'file_transfer'],
-    
-    'background': ['background', 'idle', 'keepalive', 'ntp', 'dns_background',
-                   'icmp', 'arp', 'ssh_background', 'snmp'],
-    
-    'p2p': ['p2p', 'bittorrent', 'torrent', 'peer_to_peer', 'utorrent',
-            'libtorrent', 'bittorrent_dht', 'p2p_streaming'],
+# Label mapping (hardcoded - matches training)
+LABEL_MAP = {
+    0: 'BROWSING',
+    1: 'CHAT',
+    2: 'FT',
+    3: 'MAIL',
+    4: 'P2P',
+    5: 'STREAMING',
+    6: 'VOIP'
 }
 
-CAMPUS_CATEGORIES = ['voip', 'cloud_email', 'dns', 'http', 'video', 'ftp', 'background', 'p2p']
+# Convert to lowercase for Ryu compatibility
+LABEL_MAP_LOWER = {k: v.lower() for k, v in LABEL_MAP.items()}
 
+# QoS Priority Mapping (higher number = higher priority)
 PRIORITY_MAP = {
     'voip': 10,
-    'cloud_email': 9,
-    'dns': 8,
-    'http': 5,
-    'video': 2,
-    'ftp': 2,
-    'background': 1,
-    'p2p': 1,
+    'streaming': 7,
+    'mail': 6,
+    'browsing': 5,
+    'chat': 4,
+    'ft': 3,
+    'p2p': 2,
+    'default': 4,
 }
 
 # ============================================================================
-# PPI Transform - FIXED: Correct channel order
+# Request/Response Models
 # ============================================================================
 
-class PPITransform:
-    def __init__(self):
-        self.psize_mean = 708.39
-        self.psize_scale = 581.24
-        self.ipt_mean = 228.11
-        self.ipt_scale = 1517.16
+class ClassifyRequest(BaseModel):
+    """Request model for XGBoost classification"""
+    features: List[float]  # 10 features in exact order
     
-    def __call__(self, tensor):
-        t = tensor.clone()
-        # Channel 0 = IPT (inter-packet times)
-        t[:, 0, :] = (t[:, 0, :] - self.ipt_mean) / self.ipt_scale
-        t[:, 0, :] = torch.clamp(t[:, 0, :], min=-1.0, max=1.0)
-        # Channel 1 = DIR (directions, already -1/0/1, just clamp)
-        t[:, 1, :] = torch.clamp(t[:, 1, :], min=-1.0, max=1.0)
-        # Channel 2 = SIZE (packet sizes)
-        t[:, 2, :] = (t[:, 2, :] - self.psize_mean) / self.psize_scale
-        t[:, 2, :] = torch.clamp(t[:, 2, :], min=-1.0, max=1.0)
-        return t
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "features": [
+                    29999857.0,   # duration
+                    29999857.0,   # total_fiat
+                    29975545.0,   # total_biat
+                    1.0,          # min_fiat
+                    0.0,          # min_biat
+                    1014690.0,    # max_fiat
+                    1016593.0,    # max_biat
+                    368.53,       # mean_biat
+                    1014690.0,    # max_flowiat
+                    1756.33       # mean_flowiat
+                ]
+            }
+        }
+
+
+class ClassifyResponse(BaseModel):
+    """Response model for XGBoost classification"""
+    traffic_type: str
+    traffic_type_id: int
+    confidence: float
+    priority: int
+    timestamp: float
+
+
+class HealthResponse(BaseModel):
+    status: str
+    model_loaded: bool
+    selector_loaded: bool
+    num_features: int
+    num_classes: int
+    classes: List[str]
 
 # ============================================================================
-# Traffic Class Mapper
+# XGBoost Classifier
 # ============================================================================
 
-class TrafficClassMapper:
+class XGBoostClassifier:
     def __init__(self):
-        self.specific_to_campus = {}
-        for campus_cat, specific_names in CESNET_TO_CAMPUS.items():
-            for name in specific_names:
-                self.specific_to_campus[name] = campus_cat
-        self.default_category = 'background'
-
-    def map(self, cesnet_class_name):
-        name = cesnet_class_name.lower()
-        if name in self.specific_to_campus:
-            return self.specific_to_campus[name]
-        for specific_name, campus_cat in self.specific_to_campus.items():
-            if specific_name in name or name in specific_name:
-                return campus_cat
-        return self.default_category
-
-# ============================================================================
-# Model Loader
-# ============================================================================
-
-class TrafficClassifier:
-    def __init__(self):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.selector = None
+        self.num_features = 10
+        self.num_classes = 7
         
-        self.model = mm_cesnet_v1(
-            weights=MM_CESNET_V1_Weights.CESNET_TLS22_WEEK40
-        )
-        self.ppi_transform = PPITransform()
-        
-        self.model.to(self.device)
-        self.model.eval()
-        
-        self.mapper = TrafficClassMapper()
         self.total_predictions = 0
-        self.stats = {cat: 0 for cat in CAMPUS_CATEGORIES}
+        self.stats = {label: 0 for label in LABEL_MAP.values()}
         
-        logger.info(f"Model loaded on {self.device}")
+        self._load_model()
     
-    def get_cesnet_class_name(self, class_id):
+    def _load_model(self):
+        """Load XGBoost model and feature selector"""
         try:
-            from cesnet_models.datasets import CESNET_TLS22
-            return CESNET_TLS22.classes[class_id]
-        except (ImportError, AttributeError):
-            return f"class_{class_id}"
+            # Check if files exist
+            if not os.path.exists(MODEL_PATH):
+                raise FileNotFoundError(f"Model not found at: {MODEL_PATH}")
+            if not os.path.exists(SELECTOR_PATH):
+                raise FileNotFoundError(f"Selector not found at: {SELECTOR_PATH}")
+            
+            # Load model and selector
+            self.model = joblib.load(MODEL_PATH)
+            self.selector = joblib.load(SELECTOR_PATH)
+            
+            logger.info(f"✅ Model loaded from: {MODEL_PATH}")
+            logger.info(f"✅ Selector loaded from: {SELECTOR_PATH}")
+            logger.info(f"   Features: {self.num_features}")
+            logger.info(f"   Classes: {self.num_classes}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load model: {e}")
+            raise
     
-    def predict(self, sizes, ipts, dirs, flowstats):
-        # FIXED: Build PPI tensor with correct channel order: IPT, DIR, SIZE
-        ppi_tensor = torch.tensor([
-            ipts,   # channel 0 = IPT (inter-packet times)
-            dirs,   # channel 1 = DIR (directions)
-            sizes   # channel 2 = SIZE (packet sizes)
-        ], dtype=torch.float32).unsqueeze(0)
+    def predict(self, features):
+        """
+        Predict traffic type from 10 features
         
-        ppi_tensor = self.ppi_transform(ppi_tensor)
-        flowstats_tensor = torch.tensor([flowstats], dtype=torch.float32)
+        Args:
+            features: List of 10 float values
         
-        with torch.no_grad():
-            ppi_tensor = ppi_tensor.to(self.device)
-            flowstats_tensor = flowstats_tensor.to(self.device)
-            logits = self.model((ppi_tensor, flowstats_tensor))
-            probabilities = F.softmax(logits, dim=1)
+        Returns:
+            dict with traffic_type, confidence, etc.
+        """
+        # Convert to numpy array
+        features_array = np.array(features).reshape(1, -1)
         
-        probs = probabilities[0].cpu().numpy()
+        # Validate feature count
+        if features_array.shape[1] != self.num_features:
+            raise ValueError(
+                f"Expected {self.num_features} features, got {features_array.shape[1]}"
+            )
         
-        # Convert all NumPy types to Python native types
-        top5_ids = np.argsort(probs)[-5:][::-1]
-        top5 = [{
-            'class_id': int(i),
-            'class_name': str(self.get_cesnet_class_name(i)),
-            'probability': float(probs[i])
-        } for i in top5_ids]
+        # Apply feature selection (selector transforms 10->10 if already selected)
+        # If your selector expects 15 features, adjust accordingly
+        try:
+            features_selected = self.selector.transform(features_array)
+        except:
+            # If selector expects different input, use features directly
+            # (Your Ryu already sends the 10 selected features)
+            features_selected = features_array
         
-        best_id = int(top5_ids[0])
-        best_class_name = str(self.get_cesnet_class_name(best_id))
-        campus_category = str(self.mapper.map(best_class_name))
-        confidence = float(probs[best_id])
+        # Get predictions
+        pred_class = self.model.predict(features_selected)[0]
+        probabilities = self.model.predict_proba(features_selected)[0]
+        confidence = float(np.max(probabilities))
         
-        self.stats[campus_category] += 1
+        # Map to label
+        traffic_type = LABEL_MAP.get(pred_class, 'unknown')
+        traffic_type_lower = traffic_type.lower()
+        
+        # Update stats
         self.total_predictions += 1
+        self.stats[traffic_type] = self.stats.get(traffic_type, 0) + 1
         
         return {
-            'category': campus_category,
-            'category_id': int(CAMPUS_CATEGORIES.index(campus_category)),
+            'traffic_type': traffic_type_lower,
+            'traffic_type_id': int(pred_class),
             'confidence': confidence,
-            'priority': int(PRIORITY_MAP.get(campus_category, 4)),
-            'top_prediction': {
-                'class_id': best_id,
-                'class_name': best_class_name,
-                'probability': confidence
-            },
-            'top5_predictions': top5,
+            'priority': PRIORITY_MAP.get(traffic_type_lower, 4),
+            'traffic_type_original': traffic_type,
+            'probabilities': probabilities.tolist()
+        }
+    
+    def get_stats(self):
+        return {
+            'total_predictions': self.total_predictions,
+            'traffic_type_counts': self.stats
         }
 
 # ============================================================================
@@ -189,48 +195,20 @@ class TrafficClassifier:
 # ============================================================================
 
 app = FastAPI(
-    title="SynthNet Traffic Classifier",
-    version="1.0.0"
+    title="SynthNet Traffic Classifier (XGBoost)",
+    version="2.0.0",
+    description="XGBoost-based traffic classification with 10 statistical features"
 )
 
-classifier = TrafficClassifier()
-
-# ============================================================================
-# Request/Response Models
-# ============================================================================
-
-class RawFlowRequest(BaseModel):
-    sizes: List[int]
-    ipts: List[int]
-    dirs: List[int]
-    flowstats: List[float]
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "sizes": [64] * 30,
-                "ipts": [0, 1200, 800, 3400] + [0] * 26,
-                "dirs": [1] * 30,
-                "flowstats": [0.0] * 17
-            }
-        }
-
-
-class PredictResponse(BaseModel):
-    category: str
-    category_id: int
-    confidence: float
-    priority: int
-    top_prediction: Dict = None
-    top5_predictions: List = None
-    timestamp: float
-
-
-class HealthResponse(BaseModel):
-    status: str
-    model_loaded: bool
-    cesnet_classes: int
-    campus_categories: List[str]
+# Initialize classifier
+try:
+    classifier = XGBoostClassifier()
+    logger.info("=" * 60)
+    logger.info("🚀 SynthNet XGBoost Classifier Ready")
+    logger.info("=" * 60)
+except Exception as e:
+    logger.error(f"Failed to initialize classifier: {e}")
+    classifier = None
 
 # ============================================================================
 # API Endpoints
@@ -238,58 +216,73 @@ class HealthResponse(BaseModel):
 
 @app.get("/", response_model=HealthResponse)
 async def root():
+    if classifier is None:
+        raise HTTPException(status_code=503, detail="Classifier not initialized")
+    
     return {
         "status": "running",
         "model_loaded": classifier.model is not None,
-        "cesnet_classes": NUM_CESNET_CLASSES,
-        "campus_categories": CAMPUS_CATEGORIES
+        "selector_loaded": classifier.selector is not None,
+        "num_features": classifier.num_features,
+        "num_classes": classifier.num_classes,
+        "classes": list(LABEL_MAP.values())
     }
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
+    if classifier is None:
+        raise HTTPException(status_code=503, detail="Classifier not initialized")
+    
     return {
         "status": "healthy",
         "model_loaded": classifier.model is not None,
-        "cesnet_classes": NUM_CESNET_CLASSES,
-        "campus_categories": CAMPUS_CATEGORIES
+        "selector_loaded": classifier.selector is not None,
+        "num_features": classifier.num_features,
+        "num_classes": classifier.num_classes,
+        "classes": list(LABEL_MAP.values())
     }
 
 
-@app.post("/classify", response_model=PredictResponse)
-async def classify_flow(request: RawFlowRequest):
+@app.post("/classify", response_model=ClassifyResponse)
+async def classify_flow(request: ClassifyRequest):
+    """
+    Classify traffic using XGBoost model
+    
+    Expects 10 features in this exact order:
+    1. duration
+    2. total_fiat
+    3. total_biat
+    4. min_fiat
+    5. min_biat
+    6. max_fiat
+    7. max_biat
+    8. mean_biat
+    9. max_flowiat
+    10. mean_flowiat
+    """
     start_time = time.time()
     
-    if len(request.sizes) != 30 or len(request.ipts) != 30 or len(request.dirs) != 30:
+    # Validate feature count
+    if len(request.features) != classifier.num_features:
         raise HTTPException(
             status_code=400,
-            detail=f"PPI sequences must have exactly 30 values"
-        )
-    
-    if len(request.flowstats) != 17:
-        raise HTTPException(
-            status_code=400,
-            detail=f"flowstats must have exactly 17 values"
+            detail=f"Expected {classifier.num_features} features, got {len(request.features)}"
         )
     
     try:
-        result = classifier.predict(
-            request.sizes,
-            request.ipts,
-            request.dirs,
-            request.flowstats
-        )
+        result = classifier.predict(request.features)
         
-        return PredictResponse(
-            category=result['category'],
-            category_id=result['category_id'],
+        return ClassifyResponse(
+            traffic_type=result['traffic_type'],
+            traffic_type_id=result['traffic_type_id'],
             confidence=result['confidence'],
             priority=result['priority'],
-            top_prediction=result.get('top_prediction'),
-            top5_predictions=result.get('top5_predictions'),
             timestamp=start_time
         )
         
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -297,29 +290,75 @@ async def classify_flow(request: RawFlowRequest):
 
 @app.get("/stats")
 async def get_stats():
-    return {
-        'total_predictions': classifier.total_predictions,
-        'campus_category_counts': classifier.stats,
-        'device': str(classifier.device)
-    }
+    if classifier is None:
+        raise HTTPException(status_code=503, detail="Classifier not initialized")
+    
+    return classifier.get_stats()
 
 
 @app.get("/mapping")
 async def get_mapping():
     return {
-        'cesnet_to_campus': CESNET_TO_CAMPUS,
-        'campus_categories': CAMPUS_CATEGORIES,
-        'priority_map': PRIORITY_MAP
+        'label_map': LABEL_MAP,
+        'priority_map': PRIORITY_MAP,
+        'feature_order': [
+            'duration',
+            'total_fiat',
+            'total_biat',
+            'min_fiat',
+            'min_biat',
+            'max_fiat',
+            'max_biat',
+            'mean_biat',
+            'max_flowiat',
+            'mean_flowiat'
+        ],
+        'num_features': 10,
+        'num_classes': 7
     }
 
 
+@app.post("/test")
+async def test_prediction():
+    """Test endpoint with sample features"""
+    sample_features = [
+        29999857.0,   # duration
+        29999857.0,   # total_fiat
+        29975545.0,   # total_biat
+        1.0,          # min_fiat
+        0.0,          # min_biat
+        1014690.0,    # max_fiat
+        1016593.0,    # max_biat
+        368.53,       # mean_biat
+        1014690.0,    # max_flowiat
+        1756.33       # mean_flowiat
+    ]
+    
+    result = classifier.predict(sample_features)
+    return {
+        "test_result": result,
+        "message": "Test prediction successful"
+    }
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
 if __name__ == "__main__":
     import uvicorn
+    
+    logger.info("=" * 60)
+    logger.info("Starting SynthNet XGBoost API Server")
+    logger.info("=" * 60)
+    logger.info(f"Model: {MODEL_PATH}")
+    logger.info(f"Selector: {SELECTOR_PATH}")
+    logger.info("=" * 60)
+    
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=False,  # Disabled for single worker
+        reload=False,
         log_level="info"
-        # Single worker to avoid reloading model 4 times
     )
