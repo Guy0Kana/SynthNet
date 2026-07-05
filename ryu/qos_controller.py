@@ -40,6 +40,30 @@ PRIORITY_MAP = {
 }
 
 # ============================================================
+# SECTION 1 — TC Policy Configuration
+# ============================================================
+
+TC_POLICY = {
+    'voip':       {'rate': 300, 'prio': 0, 'ceil': 1000},
+    'video':      {'rate': 200, 'prio': 1, 'ceil': 1000},
+    'cloud':      {'rate': 400, 'prio': 0, 'ceil': 1000},
+    'http':       {'rate': 100, 'prio': 2, 'ceil': 500},
+    'ftp':        {'rate': 100, 'prio': 3, 'ceil': 300},
+    'background': {'rate':  50, 'prio': 4, 'ceil': 100},
+    'default':    {'rate':  50, 'prio': 4, 'ceil': 100},
+}
+
+# Map src_ip → (host_name, tc_server_url, interface)
+HOST_TC_MAP = {
+    '10.0.0.1':  ('h1', 'http://10.0.0.1:9001/set_tc', 'h1-eth0'),
+    '10.0.0.2':  ('h2', 'http://10.0.0.2:9002/set_tc', 'h2-eth0'),
+    '10.0.0.3':  ('h3', 'http://10.0.0.3:9003/set_tc', 'h3-eth0'),
+    '10.0.0.4':  ('h4', 'http://10.0.0.4:9004/set_tc', 'h4-eth0'),
+    '10.0.0.5':  ('h5', 'http://10.0.0.5:9005/set_tc', 'h5-eth0'),
+    '10.0.0.6':  ('h6', 'http://10.0.0.6:9006/set_tc', 'h6-eth0'),
+}
+
+# ============================================================
 # FLOW BUFFER - Collects 10 features for XGBoost
 # ============================================================
 
@@ -158,14 +182,6 @@ class FlowBuffer:
     def is_dispatched(self):
         return self.completed_dispatched
 
-    # NOTE: previously this was a method named `packet_count`, which
-    # collided with the `self.packet_count` int attribute set in
-    # __init__ (the attribute shadows the method on the instance).
-    # Any call to buffer.packet_count() therefore raised
-    # `TypeError: 'int' object is not callable`, which killed
-    # classification before it ever started. Fixed by using the
-    # attribute directly everywhere instead of a same-named method.
-
 
 # ============================================================
 # MAIN RYU CONTROLLER
@@ -188,15 +204,18 @@ class QoSRyuController(app_manager.RyuApp):
             'api_calls': 0,
             'api_failures': 0,
             'packets_captured': 0,
+            'tc_policies_applied': 0,
+            'tc_failures': 0,
         }
 
         self.cleanup_thread = hub.spawn(self._cleanup_loop)
 
         self.logger.info("=" * 60)
-        self.logger.info("QoS Ryu Controller (XGBoost Version)")
+        self.logger.info("QoS Ryu Controller (XGBoost Version) + TC Integration")
         self.logger.info(f"ML API: {ML_API_URL}")
         self.logger.info(f"Min packets: {MIN_PACKETS}")
         self.logger.info(f"Feature timeout: {FEATURE_TIMEOUT}s")
+        self.logger.info(f"TC enabled hosts: {len(HOST_TC_MAP)}")
         self.logger.info("=" * 60)
 
     # ============================================================
@@ -346,6 +365,60 @@ class QoSRyuController(app_manager.RyuApp):
         return flow_key, src_ip
 
     # ============================================================
+    # SECTION 2 — TC Policy Application Method
+    # ============================================================
+
+    def _apply_tc_policy(self, src_ip, traffic_class):
+        """
+        Dynamically update tc HTB bandwidth on the source host
+        based on ML classification result.
+        Called from _classify_flow() after FastAPI returns a label.
+        """
+        if src_ip not in HOST_TC_MAP:
+            self.logger.debug(f"No tc mapping for {src_ip} — skipping")
+            return
+
+        host_name, url, intf = HOST_TC_MAP[src_ip]
+        policy = TC_POLICY.get(traffic_class, TC_POLICY['default'])
+
+        try:
+            response = requests.post(
+                url,
+                json={
+                    'rate': policy['rate'],
+                    'prio': policy['prio'],
+                    'ceil': policy['ceil'],
+                    'intf': intf,
+                },
+                timeout=1,
+            )
+            if response.status_code == 200:
+                self.logger.info(
+                    f"tc updated: {host_name} ({src_ip}) → {traffic_class} "
+                    f"[rate={policy['rate']}mbit, "
+                    f"ceil={policy['ceil']}mbit, "
+                    f"prio={policy['prio']}]"
+                )
+                self.stats['tc_policies_applied'] += 1
+            else:
+                self.logger.warning(
+                    f"tc server error for {host_name}: {response.status_code}"
+                )
+                self.stats['tc_failures'] += 1
+        except requests.exceptions.ConnectionError:
+            self.logger.warning(
+                f"tc server unreachable for {host_name} at {url} "
+                f"— is tiny_tc_server.py running on that host?"
+            )
+            self.stats['tc_failures'] += 1
+        except requests.exceptions.Timeout:
+            self.logger.warning(f"tc server timeout for {host_name}")
+            self.stats['tc_failures'] += 1
+        except Exception as e:
+            self.logger.error(f"tc policy error for {host_name}: {e}")
+            self.stats['tc_failures'] += 1
+
+    # ============================================================
     # CLASSIFICATION (Calls FastAPI)
     # ============================================================
 
@@ -372,7 +445,13 @@ class QoSRyuController(app_manager.RyuApp):
                 self.logger.info(f"Flow classified: {traffic_class} (conf: {confidence:.2f})")
                 self.stats['flows_classified'] += 1
 
+                # Store classification
                 self.flow_classifications[flow_key] = traffic_class
+
+                # ── SECTION 3: Apply tc bandwidth policy on source host ──
+                self._apply_tc_policy(src_ip, traffic_class)
+
+                # Install OpenFlow QoS rules (recommended to keep)
                 self._install_qos_flow(datapath, flow_key, in_port, traffic_class, None, dst_mac)
             else:
                 self.logger.warning(f"API error: {response.status_code}")
@@ -526,6 +605,8 @@ class QoSRyuController(app_manager.RyuApp):
             'api_calls': self.stats['api_calls'],
             'api_failures': self.stats['api_failures'],
             'packets_captured': self.stats['packets_captured'],
+            'tc_policies_applied': self.stats['tc_policies_applied'],
+            'tc_failures': self.stats['tc_failures'],
             'active_buffers': len(self.flow_buffers),
             'classified_flows': len(self.flow_classifications),
         }
