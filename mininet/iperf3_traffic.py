@@ -3,7 +3,7 @@
 # Run within mininet CLI
 
 import csv, json, threading, re, os
-from time import sleep, time as _now
+from time import sleep
 from datetime import datetime
 
 SERVER_HOST = "server"
@@ -167,46 +167,36 @@ def clear_qos():
 
 # ---------------------------------------------------------------------------
 # Individual traffic functions
-# Parameters below are tuned against real per-class medians from
-# TimeBasedFeatures-Dataset-30s-NO-VPN.arff (6,917 flows), not guesses.
 # ---------------------------------------------------------------------------
 
 def run_voip(host, duration=30):
-    """VoIP - dataset shows median flowPktsPerSecond ~100 pkt/s with
-    mean_fiat/mean_biat ~20ms (i.e. ~50 pkt/s each direction, 20ms
-    spacing) -- that's classic G.711 64 kbps RTP, not a 10 Mbps stream.
-    160-byte payload @ 64 kbps reproduces that packet rate/spacing."""
+    """VoIP - 10 Mbps UDP (high-quality video call)"""
     print(f"[VoIP]          {host.name} -> server:5201  ({duration}s)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5201 -u -b 64K -l 160 -t {duration} --json")
-    _log("voip", host, "udp", "64K", out, flow_priority="high", qos_class="EF")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5201 -u -b 10M -l 1400 -t {duration} --json")
+    _log("voip", host, "udp", "10M", out, flow_priority="high", qos_class="EF")
 
 
 def run_video(host, duration=30):
-    """Streaming - dataset shows continuous flow (no internal idle),
-    median throughput ~140 kB/s (~1.1 Mbps), duration median ~15s.
-    Real OTT streaming (Netflix/YouTube-style) is steady TCP, not
-    constant-rate UDP, so this switched from UDP to TCP."""
-    print(f"[Streaming]     {host.name} -> server:5202  ({duration}s, steady TCP)")
-    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5202 -b 2M -t {duration} --json")
-    _log("streaming", host, "tcp", "2M", out, flow_priority="medium", qos_class="AF41")
+    """HD video stream - 5 Mbps UDP"""
+    print(f"[Video]         {host.name} -> server:5202  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5202 -u -b 5M -l 1400 -t {duration} --json")
+    _log("video", host, "udp", "5M", out, flow_priority="medium", qos_class="AF41")
 
 
 def run_web(host, duration=30):
-    """Browsing - dataset shows very low throughput (median ~1.4 kB/s)
-    with active windows ~4.9s (mean_active) separated by idle gaps
-    ~4s (mean_idle, ranging 1.9-6.9s). Small page-load-sized transfer
-    per active window instead of an unrestricted -P4 flood."""
-    print(f"[Web]           {host.name} -> server:5203  ({duration}s, page-load bursts)")
-    elapsed = 0.0
+    """Web browsing - bursty TCP with idle gaps"""
+    print(f"[Web]           {host.name} -> server:5203  ({duration}s, bursty)")
+    end_time = duration
+    elapsed = 0
     burst_n = 0
-    while elapsed < duration:
-        t0 = _now()
-        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203 -n 100K --json")
-        elapsed += (_now() - t0)
-        _log(f"http_burst{burst_n}", host, "tcp", "n/a", out,
+    while elapsed < end_time:
+        burst_len = min(2, end_time - elapsed)
+        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203 -P 4 -t {burst_len} --json")
+        _log(f"http_burst{burst_n}", host, "tcp", "unlimited", out,
              flow_priority="low", qos_class="best-effort")
+        elapsed += burst_len
         burst_n += 1
-        idle = min(4, duration - elapsed)
+        idle = min(1.5, end_time - elapsed)
         if idle > 0:
             sleep(idle)
             elapsed += idle
@@ -214,66 +204,37 @@ def run_web(host, duration=30):
 
 
 def run_file_transfer(host, duration=30):
-    """FT - dataset shows a strikingly short median duration (~14ms)
-    with very high packet rate (~787 pkt/s) and no idle -- i.e. one
-    quick full-speed burst per "file", not one continuous 15-30s
-    stream. Modeled as repeated quick fixed-size bursts back-to-back."""
-    print(f"[File Transfer] {host.name} -> server:5204  ({duration}s, quick bursts)")
-    elapsed = 0.0
-    xfer_n = 0
-    while elapsed < duration:
-        t0 = _now()
-        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5204 -n 2M --json")
-        elapsed += (_now() - t0)
-        _log(f"ft_xfer{xfer_n}", host, "tcp", "n/a", out,
-             flow_priority="low", qos_class="bulk")
-        xfer_n += 1
-    print(f"[File Transfer] {host.name} done ({xfer_n} quick transfers)")
+    """FTP / bulk transfer - uncapped TCP"""
+    print(f"[File Transfer] {host.name} -> server:5204  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5204 -t {duration} --json")
+    _log("ftp", host, "tcp", "unlimited", out, flow_priority="low", qos_class="bulk")
 
 
 def run_background(host, duration=30):
-    """P2P - dataset shows short (~0.39s median) low-rate (~2.2 kB/s
-    median) connections with no internal idle. Modeled as several
-    parallel low-rate mini-connections with churn (start/stop) rather
-    than one steady low-rate flow."""
-    print(f"[Background/P2P] {host.name} -> server:5205  ({duration}s, peer churn)")
-    elapsed = 0.0
+    """Background - low duty-cycle TCP with scaled idle times"""
+    print(f"[Background]    {host.name} -> server:5205  ({duration}s, low duty-cycle)")
+    elapsed = 0
     chunk_n = 0
+    idle_time = min(6, max(1, duration // 5))
     while elapsed < duration:
-        t0 = _now()
-        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5205 -P 3 -b 20K -t 1 --json")
-        elapsed += (_now() - t0)
-        _log(f"p2p_chunk{chunk_n}", host, "tcp", "20K", out,
+        on_time = min(2, duration - elapsed)
+        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5205 -b 1M -t {on_time} --json")
+        _log(f"background_chunk{chunk_n}", host, "tcp", "1M", out,
              flow_priority="lowest", qos_class="background")
+        elapsed += on_time
         chunk_n += 1
-        churn_gap = min(1, duration - elapsed)
-        if churn_gap > 0:
-            sleep(churn_gap)
-            elapsed += churn_gap
-    print(f"[Background/P2P] {host.name} done ({chunk_n} peer churns)")
+        idle = min(idle_time, duration - elapsed)
+        if idle > 0:
+            sleep(idle)
+            elapsed += idle
+    print(f"[Background]    {host.name} done ({chunk_n} active chunks)")
 
 
 def run_cloud(host, duration=30):
-    """Mail - dataset shows a very short median duration (~32ms) with
-    moderate packet rate (~93 pkt/s) and small throughput (~5 kB/s
-    median), no idle -- one quick small message, not a steady 50 Mbps
-    stream. Modeled as repeated small fixed-size bursts with short
-    pauses between separate "mail check" events."""
-    print(f"[Cloud/Mail]    {host.name} -> server:5206  ({duration}s, message bursts)")
-    elapsed = 0.0
-    msg_n = 0
-    while elapsed < duration:
-        t0 = _now()
-        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -n 12K --json")
-        elapsed += (_now() - t0)
-        _log(f"mail_msg{msg_n}", host, "tcp", "n/a", out,
-             flow_priority="high", qos_class="AF31")
-        msg_n += 1
-        gap = min(2, duration - elapsed)
-        if gap > 0:
-            sleep(gap)
-            elapsed += gap
-    print(f"[Cloud/Mail]    {host.name} done ({msg_n} messages)")
+    """Cloud/Email - steady TCP, protected, high bandwidth"""
+    print(f"[Cloud]         {host.name} -> server:5206  ({duration}s)")
+    out = host.cmd(f"iperf3 -c {_server_ip()} -p 5206 -b 50M -u {duration} --json")
+    _log("cloud", host, "tcp", "50M", out, flow_priority="high", qos_class="AF31")
 
 
 def run_dns(host, count=20):
@@ -508,11 +469,11 @@ print("  run_comparison_test(20)     - Compare both scenarios")
 print("  stop_all_traffic()          - Kill all iperf3 processes")
 print("  save_logs()                 - Export results to CSV")
 print("\nIndividual commands:")
-print("  run_voip(h1)                - VoIP on h1 (64K UDP, dataset-matched)")
-print("  run_video(h2)               - Streaming on h2 (2M TCP, steady)")
-print("  run_web(h3)                 - Browsing on h3 (page-load bursts)")
-print("  run_file_transfer(h4)       - FT on h4 (quick repeated bursts)")
-print("  run_background(h5)          - P2P on h5 (parallel low-rate churn)")
-print("  run_cloud(h6)               - Mail on h6 (small message bursts)")
+print("  run_voip(h1)                - VoIP on h1 (10M, protected)")
+print("  run_video(h2)               - Video on h2 (5M)")
+print("  run_web(h3)                 - Web on h3 (bursty)")
+print("  run_file_transfer(h4)       - File transfer on h4 (uncapped)")
+print("  run_background(h5)          - Background on h5 (low duty-cycle)")
+print("  run_cloud(h6)               - Cloud on h6 (50M, protected)")
 print("  run_dns(h5)                 - DNS simulation on h5")
 print("  run_ping(h1)                - Ping latency test")
