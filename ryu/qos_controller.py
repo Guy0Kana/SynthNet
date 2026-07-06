@@ -187,16 +187,7 @@ class FlowBuffer:
 
     # ── get_flowstats — matches ISCX feature set ──────────────────────────────
     def get_flowstats(self):
-        # FIX: duration must be in microseconds to match the units used by
-        # every other feature here (_iat_stats already multiplies by 1e6)
-        # and by the training data (ARFF durations run ~1e4-3e7 range,
-        # i.e. microseconds). Previously this was left in raw seconds,
-        # so every live classification sent a duration ~1,000,000x smaller
-        # than what the model was trained on, regardless of actual traffic.
-        # flowPktsPerSecond/flowBytesPerSecond still need real seconds,
-        # so both units are kept as separate local variables.
-        duration_s  = max(time.time() - self.start_time, 0.001)
-        duration_us = duration_s * 1e6
+        duration = max(time.time() - self.start_time, 0.001)
 
         total_pkts  = self.packets_fwd + self.packets_rev
         total_bytes = self.bytes_fwd   + self.bytes_rev
@@ -228,7 +219,7 @@ class FlowBuffer:
 
         return {
             # Core timing
-            'duration':            duration_us,
+            'duration':            duration,
             'total_fiat':          total_fiat,
             'total_biat':          total_biat,
             'min_fiat':            min_fiat,
@@ -242,9 +233,9 @@ class FlowBuffer:
             'max_flowiat':         max_flowiat,
             'mean_flowiat':        mean_flowiat,
             'std_flowiat':         std_flowiat,
-            # Throughput (needs real seconds, not microseconds)
-            'flowPktsPerSecond':   total_pkts  / duration_s,
-            'flowBytesPerSecond':  total_bytes / duration_s,
+            # Throughput
+            'flowPktsPerSecond':   total_pkts  / duration,
+            'flowBytesPerSecond':  total_bytes / duration,
             # Active / idle
             'min_active':          min_active,
             'mean_active':         mean_active,
@@ -443,14 +434,10 @@ class QoSRyuController(app_manager.RyuApp):
         try:
             flowstats = buffer.get_flowstats()
 
-            # NOTE: flowstats['duration'] is now in microseconds (see the
-            # FIX in get_flowstats), so the human-readable log below uses
-            # the buffer's own elapsed real-time instead, to keep printing
-            # actual seconds rather than a huge microsecond value.
             self.logger.info(
                 f"Classifying {src_ip} "
                 f"({buffer.packet_count()} packets, "
-                f"{time.time() - buffer.start_time:.1f}s)"
+                f"{flowstats['duration']:.1f}s)"
             )
 
             # Build the 10 features list for XGBoost
