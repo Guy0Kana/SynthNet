@@ -106,6 +106,15 @@ def save_logs():
         writer.writerows(_results)
     print(f"Saved {len(_results)} rows -> {LOG_FILE}")
 
+def clear_logs():
+    """Clear all logs from memory and delete the log file."""
+    global _results
+    _results = []
+    if os.path.exists(LOG_FILE):
+        os.remove(LOG_FILE)
+        print(f"[LOG] Cleared log file: {LOG_FILE}")
+    print(f"[LOG] Memory logs cleared ({len(_results)} entries)")
+
 
 def _run_concurrent(fns):
     threads = [threading.Thread(target=fn) for fn in fns]
