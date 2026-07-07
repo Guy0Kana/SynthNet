@@ -197,6 +197,7 @@ def run_voip(host, duration=30):
 def run_video(host, duration=30, greedy=False):
     print(f"[Video]         {host.name} -> server:5202  ({duration}s)")
     if greedy:
+        # Continuous greedy traffic
         out = host.cmd(f"iperf3 -c {_server_ip()} -p 5202 -u -b 0 -l 1400 -t {duration} --json")
         _log("video", host, "udp", "unlimited", out, flow_priority="medium", qos_class="best-effort")
     else:
@@ -207,11 +208,26 @@ def run_video(host, duration=30, greedy=False):
 def run_web(host, duration=30, greedy=False):
     print(f"[Web]           {host.name} -> server:5203  ({duration}s)")
     if greedy:
-        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203 -t {duration} --json")
+        # Continuous greedy traffic - parallel streams for high throughput
+        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203 -P 8 -t {duration} --json")
         _log("http", host, "tcp", "unlimited", out, flow_priority="low", qos_class="best-effort")
     else:
-        out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203 -b 60M -t {duration} --json")
-        _log("http", host, "tcp", "60M", out, flow_priority="low", qos_class="best-effort")
+        # Bursty pattern for QoS demo
+        end_time = duration
+        elapsed = 0
+        burst_n = 0
+        while elapsed < end_time:
+            burst_len = min(2, end_time - elapsed)
+            out = host.cmd(f"iperf3 -c {_server_ip()} -p 5203 -P 4 -t {burst_len} --json")
+            _log(f"http_burst{burst_n}", host, "tcp", "unlimited", out,
+                 flow_priority="low", qos_class="best-effort")
+            elapsed += burst_len
+            burst_n += 1
+            idle = min(1.5, end_time - elapsed)
+            if idle > 0:
+                sleep(idle)
+                elapsed += idle
+        print(f"[Web]           {host.name} done ({burst_n} bursts)")
 
 
 def run_file_transfer(host, duration=30):
@@ -343,7 +359,7 @@ def run_stress_test(duration=30, with_qos=True):
             if protocol == "udp":
                 out = host.cmd(f"iperf3 -c {server_ip} -p {port} -u -b 0 -l 1400 -t {duration} --json")
             else:
-                out = host.cmd(f"iperf3 -c {server_ip} -p {port} -t {duration} --json")
+                out = host.cmd(f"iperf3 -c {server_ip} -p {port} -P 8 -t {duration} --json")
             _log(profile, host, protocol, "unlimited", out, flow_priority=priority, qos_class=qos_class)
         else:
             if protocol == "udp":
@@ -352,7 +368,7 @@ def run_stress_test(duration=30, with_qos=True):
                 out = host.cmd(f"iperf3 -c {server_ip} -p {port} -b {bandwidth} -t {duration} --json")
             _log(profile, host, protocol, bandwidth, out, flow_priority=priority, qos_class=qos_class)
 
-    # When QoS is disabled (with_qos=False), HTTP and Video become greedy (b=0)
+    # When QoS is disabled (with_qos=False), HTTP and Video become greedy (unlimited)
     greedy_http = not with_qos
     greedy_video = not with_qos
 
@@ -380,7 +396,7 @@ def run_stress_test(duration=30, with_qos=True):
         print("     ❌ VoIP:  ~2-5 Mbps   (STARVED)")
         print("     ❌ Cloud: ~5-10 Mbps  (STARVED)")
         print("     ✅ Video: ~100+ Mbps  (GREEDY - unlimited)")
-        print("     ✅ HTTP:  ~100+ Mbps  (GREEDY - unlimited)")
+        print("     ✅ HTTP:  ~100+ Mbps  (GREEDY - unlimited, 8 streams)")
         print("     ✅ FTP:   ~20 Mbps    (GREEDY)")
         print("     ✅ Bkgnd: ~7 Mbps     (GREEDY)")
     print("="*70)
@@ -448,7 +464,7 @@ print("  save_logs()                 - Export results to CSV")
 print("\nIndividual commands:")
 print("  run_voip(h1)                - VoIP on h1 (20M, protected)")
 print("  run_video(h2)               - Video on h2 (50M, unlimited in no-qos)")
-print("  run_web(h3)                 - Web on h3 (60M, unlimited in no-qos)")
+print("  run_web(h3)                 - Web on h3 (60M, unlimited in no-qos with 8 streams)")
 print("  run_file_transfer(h4)       - File transfer on h4 (20M)")
 print("  run_background(h5)          - Background on h5 (7M)")
 print("  run_cloud(h6)               - Cloud on h6 (30M, protected)")
