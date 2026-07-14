@@ -21,7 +21,7 @@ class CampusTopo(Topo):
         h5 = self.addHost("h5", ip = "10.0.0.5/24") #P2P
         h6 = self.addHost("h6", ip = "10.0.0.6/24") #cloud/email
 
-        link_opts = dict(bw = 1000, delay = "5ms", loss = 0) #1Gbps, 5ms delay, no loss. Can increase loss to simulate congestion/test robustness
+        link_opts = dict(bw = 200, delay = "5ms", loss = 0) #1Gbps, 5ms delay, no loss. Can increase loss to simulate congestion/test robustness
 
         for host in [server, h1, h2, h3, h4, h5, h6]:
             self.addLink(host, s1, cls = TCLink, **link_opts)
