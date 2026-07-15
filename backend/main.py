@@ -53,9 +53,9 @@ encoder  = None
 async def lifespan(app: FastAPI):
     global model, selector, encoder
     logger.info("Loading model artifacts...")
-    model    = joblib.load("traffic_classifier.pkl")
-    selector = joblib.load("feature_selector.pkl")
-    encoder  = joblib.load("label_encoder.pkl")
+    model    = joblib.load("model/traffic_classifier.pkl")
+    selector = joblib.load("model/feature_selector.pkl")
+    encoder  = joblib.load("model/label_encoder.pkl")
     logger.info(f"Model loaded. Classes: {list(encoder.classes_)}")
     logger.info(f"Selected features: {SELECTED_FEATURES}")
     yield
