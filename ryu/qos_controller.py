@@ -430,36 +430,18 @@ class QoSRyuController(app_manager.RyuApp):
     # ── Classify flow ─────────────────────────────────────────────────────────
     def _classify_flow(self, datapath, flow_key, in_port, buffer, dst_mac=None):
         src_ip = flow_key[0]
-
         try:
             flowstats = buffer.get_flowstats()
-
             self.logger.info(
                 f"Classifying {src_ip} "
                 f"({buffer.packet_count()} packets, "
                 f"{flowstats['duration']:.1f}s)"
             )
 
-            # Build the 10 features list for XGBoost
-            features_list = [
-                flowstats['duration'],
-                flowstats['total_fiat'],
-                flowstats['total_biat'],
-                flowstats['min_fiat'],
-                flowstats['min_biat'],
-                flowstats['max_fiat'],
-                flowstats['max_biat'],
-                flowstats['mean_biat'],
-                flowstats['max_flowiat'],
-                flowstats['mean_flowiat'],
-            ]
-
-            self.logger.debug(f"Features: {features_list}")
-
             self.stats['api_calls'] += 1
             response = requests.post(
                 ML_API_URL,
-                json={'features': features_list},
+                json=flowstats,
                 timeout=15,
             )
 
