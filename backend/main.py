@@ -56,8 +56,14 @@ async def lifespan(app: FastAPI):
     model    = joblib.load("model/traffic_classifier.pkl")
     selector = joblib.load("model/feature_selector.pkl")
     encoder  = joblib.load("model/label_encoder.pkl")
+    
+    dummy = np.zeros((1, 10))
+    model.predict(dummy)
+    model.predict_proba(dummy)
+    
     logger.info(f"Model loaded. Classes: {list(encoder.classes_)}")
     logger.info(f"Selected features: {SELECTED_FEATURES}")
+    logger.info("Model pre-warmed and ready")
     yield
 
 
