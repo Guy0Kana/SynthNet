@@ -460,7 +460,7 @@ class QoSRyuController(app_manager.RyuApp):
             response = requests.post(
                 ML_API_URL,
                 json={'features': features_list},
-                timeout=3,
+                timeout=15,
             )
 
             if response.status_code == 200:
