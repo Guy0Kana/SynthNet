@@ -7,8 +7,8 @@
 
 body {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    background: #0a0e17;
-    color: #e0e6ed;
+    background: #f0f4f8;
+    color: #1a2332;
     min-height: 100vh;
     padding: 20px;
 }
@@ -25,10 +25,11 @@ header {
     justify-content: space-between;
     align-items: center;
     padding: 20px 30px;
-    background: #111927;
+    background: #ffffff;
     border-radius: 16px;
-    border: 1px solid #1e2a3a;
+    border: 1px solid #dce4ec;
     margin-bottom: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
 }
 
 .logo {
@@ -44,11 +45,11 @@ header {
 .logo h1 {
     font-size: 24px;
     font-weight: 700;
-    color: #e0e6ed;
+    color: #1a2332;
 }
 
 .logo .highlight {
-    color: #00e676;
+    color: #0d9488;
 }
 
 .header-info {
@@ -68,16 +69,16 @@ header {
 }
 
 .status-badge.live {
-    background: rgba(0, 230, 118, 0.15);
-    color: #00e676;
-    border: 1px solid rgba(0, 230, 118, 0.3);
+    background: rgba(13, 148, 136, 0.10);
+    color: #0d9488;
+    border: 1px solid rgba(13, 148, 136, 0.25);
 }
 
 .status-badge .dot {
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: #00e676;
+    background: #0d9488;
     animation: pulse 1.5s ease-in-out infinite;
 }
 
@@ -88,7 +89,7 @@ header {
 
 .time {
     font-size: 13px;
-    color: #8892a8;
+    color: #5e6f8d;
 }
 
 /* Stats Grid */
@@ -100,18 +101,19 @@ header {
 }
 
 .stat-card {
-    background: #111927;
-    border: 1px solid #1e2a3a;
+    background: #ffffff;
+    border: 1px solid #dce4ec;
     border-radius: 12px;
     padding: 20px 24px;
     display: flex;
     align-items: center;
     gap: 16px;
     transition: border-color 0.3s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }
 
 .stat-card:hover {
-    border-color: #2a3a50;
+    border-color: #b8c5d4;
 }
 
 .stat-icon {
@@ -128,29 +130,30 @@ header {
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: #8892a8;
+    color: #5e6f8d;
 }
 
 .stat-value {
     font-size: 28px;
     font-weight: 700;
-    color: #e0e6ed;
+    color: #1a2332;
     margin-top: 2px;
 }
 
 /* Sections */
 section {
-    background: #111927;
-    border: 1px solid #1e2a3a;
+    background: #ffffff;
+    border: 1px solid #dce4ec;
     border-radius: 12px;
     padding: 24px 28px;
     margin-bottom: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }
 
 section h2 {
     font-size: 18px;
     font-weight: 600;
-    color: #e0e6ed;
+    color: #1a2332;
     margin-bottom: 16px;
 }
 
@@ -178,8 +181,8 @@ section h2 {
     gap: 10px;
     padding: 10px 14px;
     border-radius: 8px;
-    background: #0d1520;
-    border: 1px solid #1a2636;
+    background: #f7f9fc;
+    border: 1px solid #e8edf3;
 }
 
 .priority-item .color-bar {
@@ -196,12 +199,12 @@ section h2 {
 .priority-item .info .label {
     font-size: 12px;
     font-weight: 500;
-    color: #e0e6ed;
+    color: #1a2332;
 }
 
 .priority-item .info .priority {
     font-size: 10px;
-    color: #8892a8;
+    color: #5e6f8d;
 }
 
 /* Table */
@@ -216,7 +219,7 @@ table {
 }
 
 table thead tr {
-    border-bottom: 1px solid #1e2a3a;
+    border-bottom: 1px solid #dce4ec;
 }
 
 table th {
@@ -226,22 +229,23 @@ table th {
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: #8892a8;
+    color: #5e6f8d;
 }
 
 table td {
     padding: 10px 14px;
-    border-bottom: 1px solid #0d1520;
+    border-bottom: 1px solid #eef2f7;
     font-size: 13px;
+    color: #1a2332;
 }
 
 table tbody tr:hover {
-    background: #0d1520;
+    background: #f7f9fc;
 }
 
 .loading-text {
     text-align: center;
-    color: #8892a8;
+    color: #5e6f8d;
     padding: 30px !important;
 }
 
@@ -254,16 +258,16 @@ table tbody tr:hover {
     font-weight: 500;
 }
 
-.badge-voip { background: rgba(0, 230, 118, 0.2); color: #00e676; }
-.badge-cloud_email { background: rgba(41, 121, 255, 0.2); color: #2979ff; }
-.badge-cloud { background: rgba(41, 121, 255, 0.2); color: #2979ff; }
-.badge-dns { background: rgba(0, 188, 212, 0.2); color: #00bcd4; }
-.badge-http { background: rgba(255, 235, 59, 0.2); color: #ffeb3b; }
-.badge-video { background: rgba(255, 87, 34, 0.2); color: #ff5722; }
-.badge-ftp { background: rgba(255, 152, 0, 0.2); color: #ff9800; }
-.badge-background { background: rgba(120, 144, 156, 0.2); color: #78909c; }
-.badge-p2p { background: rgba(233, 30, 99, 0.2); color: #e91e63; }
-.badge-ping { background: rgba(77, 208, 225, 0.2); color: #4dd0e1; }
+.badge-voip { background: rgba(13, 148, 136, 0.12); color: #0d7a70; }
+.badge-cloud_email { background: rgba(37, 99, 235, 0.12); color: #1d4ed8; }
+.badge-cloud { background: rgba(37, 99, 235, 0.12); color: #1d4ed8; }
+.badge-dns { background: rgba(8, 145, 178, 0.12); color: #0e7490; }
+.badge-http { background: rgba(202, 138, 4, 0.12); color: #a16207; }
+.badge-video { background: rgba(220, 38, 38, 0.12); color: #b91c1c; }
+.badge-ftp { background: rgba(234, 88, 12, 0.12); color: #c2410c; }
+.badge-background { background: rgba(100, 116, 139, 0.12); color: #475569; }
+.badge-p2p { background: rgba(190, 24, 93, 0.12); color: #be185d; }
+.badge-ping { background: rgba(6, 182, 212, 0.12); color: #0891b2; }
 
 /* Distribution Bars */
 .distribution-bars {
@@ -282,14 +286,14 @@ table tbody tr:hover {
     width: 120px;
     font-size: 13px;
     font-weight: 500;
-    color: #e0e6ed;
+    color: #1a2332;
     flex-shrink: 0;
 }
 
 .bar-track {
     flex: 1;
     height: 24px;
-    background: #0d1520;
+    background: #eef2f7;
     border-radius: 6px;
     overflow: hidden;
     position: relative;
@@ -305,13 +309,13 @@ table tbody tr:hover {
     padding-right: 10px;
     font-size: 11px;
     font-weight: 600;
-    color: #0a0e17;
+    color: #ffffff;
     min-width: 30px;
 }
 
 .bar-value {
     font-size: 13px;
-    color: #8892a8;
+    color: #5e6f8d;
     width: 80px;
     text-align: right;
     flex-shrink: 0;
@@ -319,9 +323,9 @@ table tbody tr:hover {
 
 /* Button */
 .btn-refresh {
-    background: #1e2a3a;
-    border: 1px solid #2a3a50;
-    color: #e0e6ed;
+    background: #eef2f7;
+    border: 1px solid #dce4ec;
+    color: #1a2332;
     padding: 6px 16px;
     border-radius: 8px;
     cursor: pointer;
@@ -331,17 +335,17 @@ table tbody tr:hover {
 }
 
 .btn-refresh:hover {
-    background: #2a3a50;
-    border-color: #3a4a60;
+    background: #dce4ec;
+    border-color: #b8c5d4;
 }
 
 /* Footer */
 footer {
     text-align: center;
     padding: 20px;
-    color: #8892a8;
+    color: #5e6f8d;
     font-size: 13px;
-    border-top: 1px solid #1e2a3a;
+    border-top: 1px solid #dce4ec;
 }
 
 /* Responsive */
